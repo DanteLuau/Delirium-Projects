@@ -2033,7 +2033,13 @@ function Tab:CreateSection(title: string)
     return section
 end
 
-function Tab:SetActive(active: boolean)
+-- ─── Private: pure visual activation update ───────────────────────────────
+--
+-- Called exclusively by Window:SelectTab to apply visual state without
+-- any SelectTab recursion. External code should use SetActive() instead,
+-- which routes through SelectTab to guarantee mutual exclusivity.
+
+function Tab:_ApplyActive(active: boolean)
     self.IsActive = active
     self.PageCanvas.Visible = active
 
@@ -2061,11 +2067,53 @@ function Tab:SetActive(active: boolean)
     end
 end
 
+-- ─── Public: tab activation ───────────────────────────────────────────────
+--
+-- FIX (BUG-TAB-DUAL): Previously this method applied visual state directly
+-- without notifying sibling tabs, allowing multiple tabs to show as active
+-- simultaneously (e.g. test T04.6 calling Tab5:SetActive(true) while Tab1
+-- was still visible caused two PageCanvases to be Visible=true at once,
+-- which locked the UI).
+--
+-- SetActive(true)  → delegates to Window:SelectTab, which calls _ApplyActive
+--                    on all tabs, guaranteeing mutual exclusivity.
+-- SetActive(false) → directly applies the inactive visual state (safe, no
+--                    sibling tabs are affected).
+
+function Tab:SetActive(active: boolean)
+    if active then
+        -- Route through Window:SelectTab so all sibling tabs are deactivated first.
+        self.WindowManager:SelectTab(self)
+    else
+        self:_ApplyActive(false)
+    end
+end
+
 -- ─── Destroy (idempotent) ──────────────────────────────────────────────────
 
 function Tab:Destroy()
     if self._destroyed then return end
     self._destroyed = true
+
+    -- FIX (BUG-TAB-STALE): Remove self from the Window's tab registry so that
+    -- Window:SelectTab never iterates over destroyed Tab instances (which would
+    -- error on Visible = active since PageCanvas is already destroyed).
+    -- Also clear CurrentTab if this was the active one.
+    local wm = self.WindowManager
+    if wm then
+        local tabs = wm._tabs
+        if tabs then
+            for i, t in ipairs(tabs) do
+                if t == self then
+                    table.remove(tabs, i)
+                    break
+                end
+            end
+        end
+        if wm.CurrentTab == self then
+            wm.CurrentTab = nil
+        end
+    end
 
     -- Cascade: destroy all owned sections (Section → Component)
     for _, section in ipairs(self._sections) do
@@ -2159,12 +2207,34 @@ function Window.new(config: table, parentGui: ScreenGui)
     ComponentHelper.AddCorner(self.MainFrame, 10)
     local mainStroke = ComponentHelper.AddStroke(self.MainFrame, ThemeEngine.GetToken("Border"), 1)
 
+    -- ─── Input sink ──────────────────────────────────────────────────────
+    -- Transparent TextButton at ZIndex=1 (lowest possible) covering the full
+    -- MainFrame. Absorbs clicks/touches that land on empty window background
+    -- so they don't fall through to the game camera or input stack.
+    --
+    -- FIX (BUG-NAV): InputSink MUST be created FIRST — before TitleBar and
+    -- ContentContainer — so that at equal ZIndex (1) the later-added siblings
+    -- (TitleBar, ContentContainer) rank above it in Roblox's Sibling input
+    -- dispatch. With the old ordering (InputSink last) it shadowed every
+    -- interactive child of TitleBar and ContentContainer, making title buttons,
+    -- NavButtons, and all component inputs completely unresponsive.
+    ComponentHelper.Create("TextButton", {
+        Name                   = "InputSink",
+        Size                   = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text                   = "",
+        AutoButtonColor        = false,
+        ZIndex                 = 1,
+        Parent                 = self.MainFrame,
+    })
+
     -- ─── Title bar ───────────────────────────────────────────────────────
 
     self.TitleBar = ComponentHelper.Create("Frame", {
         Name                   = "TitleBar",
         Size                   = UDim2.new(1, 0, 0, TITLEBAR_H),
         BackgroundTransparency = 1,
+        ZIndex                 = 2,   -- above InputSink (ZIndex=1); propagates to all children
         Parent                 = self.MainFrame,
     })
     ComponentHelper.AddPadding(self.TitleBar, 0, 0, 16, 16)
@@ -2250,23 +2320,6 @@ function Window.new(config: table, parentGui: ScreenGui)
         self:Close()
     end))
 
-    -- ─── Input sink ──────────────────────────────────────────────────────
-    -- Transparent TextButton covering the entire MainFrame at ZIndex 1.
-    -- Any touch/click on empty window space is consumed here instead of
-    -- falling through to the game's camera or input stack.
-    -- Interactive children (ZIndex > 1) still receive their inputs first
-    -- because Roblox gives input to the highest-ZIndex visible GuiObject
-    -- at the cursor position.
-    ComponentHelper.Create("TextButton", {
-        Name                   = "InputSink",
-        Size                   = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-        Text                   = "",
-        AutoButtonColor        = false,
-        ZIndex                 = 1,
-        Parent                 = self.MainFrame,
-    })
-
     -- ─── Content container ───────────────────────────────────────────────
 
     self.ContentContainer = ComponentHelper.Create("Frame", {
@@ -2274,6 +2327,7 @@ function Window.new(config: table, parentGui: ScreenGui)
         Size                   = UDim2.new(1, 0, 1, -TITLEBAR_H),
         Position               = UDim2.new(0, 0, 0, TITLEBAR_H),
         BackgroundTransparency = 1,
+        ZIndex                 = 2,   -- above InputSink (ZIndex=1); propagates to all children
         Parent                 = self.MainFrame,
     })
 
@@ -2623,9 +2677,14 @@ function Window:CreateTab(config: table)
     return tab
 end
 
+-- SelectTab: the single authoritative source of tab activation.
+-- Uses Tab:_ApplyActive() (private visual-only method) so there is no
+-- circular call back into SelectTab. Skips destroyed tab entries.
 function Window:SelectTab(targetTab)
     for _, tab in ipairs(self._tabs) do
-        tab:SetActive(tab == targetTab)
+        if not tab._destroyed then
+            tab:_ApplyActive(tab == targetTab)
+        end
     end
     self.CurrentTab = targetTab
 end
