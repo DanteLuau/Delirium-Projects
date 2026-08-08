@@ -2240,13 +2240,13 @@ function Window.new(config: table, parentGui: ScreenGui)
     self._minimizeBtn.LayoutOrder = 2
     self._closeBtn.LayoutOrder    = 3
 
-    self._maid:GiveTask(self._miniIconBtn.MouseButton1Click:Connect(function()
+    self._maid:GiveTask(self._miniIconBtn.Activated:Connect(function()
         self:MiniIconify()
     end))
-    self._maid:GiveTask(self._minimizeBtn.MouseButton1Click:Connect(function()
+    self._maid:GiveTask(self._minimizeBtn.Activated:Connect(function()
         self:ToggleMinimize()
     end))
-    self._maid:GiveTask(self._closeBtn.MouseButton1Click:Connect(function()
+    self._maid:GiveTask(self._closeBtn.Activated:Connect(function()
         self:Close()
     end))
 
@@ -2369,6 +2369,7 @@ function Window:_BuildTitleButton(parent: Frame, icon: string, hoverBg: Color3):
         TextColor3             = ThemeEngine.GetToken("SubText"),
         AutoButtonColor        = false,
         BorderSizePixel        = 0,
+        ZIndex                 = 10,
         Parent                 = parent,
     })
     ComponentHelper.AddCorner(btn, 6)
