@@ -3452,9 +3452,13 @@ function ColorPicker.New(parent: Instance, config: table)
     end
 
     function api:Set(color: Color3)
-        currentColor = color
+        -- Decompose to HSV for the picker UI, then restore the exact Color3
+        -- so Get() returns the same reference that was passed in.
+        -- (Color3.fromHSV round-trips introduce sub-LSB float drift.)
         h, s, v = toHSV(color)
         rebuildColor()
+        currentColor = color   -- overwrite the fromHSV-derived value with the exact input
+        Swatch.BackgroundColor3 = color
     end
 
     function api:Enable()
@@ -5045,6 +5049,10 @@ function Toggle.New(parent: Instance, config: table)
 
     function api:Set(val: boolean)
         applyState(val == true, true)
+    end
+
+    function api:Toggle()
+        applyState(not state, true)
     end
 
     function api:Enable()
