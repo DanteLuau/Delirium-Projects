@@ -1,4 +1,4 @@
--- Delirium v1.0.0
+-- Delirium v1.1.0
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -1809,7 +1809,7 @@ function Section:SetCollapsed(collapsed: boolean, animate: boolean)
 
         if animate then
             TweenHelper.Tween(self.Frame, TweenHelper.FastInfo,
-                { Size = UDim2.new(1, 0, 0, COLLAPSED_H) })
+                { Size = UDim2.new(1, 0, 0, COLLAPSED_H) }, "collapse")
         else
             self.Frame.Size = UDim2.new(1, 0, 0, COLLAPSED_H)
         end
@@ -1820,17 +1820,12 @@ function Section:SetCollapsed(collapsed: boolean, animate: boolean)
             or (COLLAPSED_H + self._layout.AbsoluteContentSize.Y + 8)
 
         if animate then
+            -- Use the same "collapse" key so a rapid retoggle cancels the
+            -- in-flight tween in both directions instead of stacking.
             TweenHelper.Tween(self.Frame, TweenHelper.FastInfo,
-                { Size = UDim2.new(1, 0, 0, targetH) },
-                function()
-                    -- Re-enable AutomaticSize after tween completes so future
-                    -- component additions still auto-resize the section.
-                    if not self._collapsed then
-                        self.Frame.AutomaticSize = Enum.AutomaticSize.Y
-                    end
-                end)
-            -- Re-enable after tween time; Tween() doesn't expose a Completed cb,
-            -- so use task.delay with a conservative offset.
+                { Size = UDim2.new(1, 0, 0, targetH) }, "collapse")
+            -- Re-enable AutomaticSize after the tween settles so future
+            -- component additions continue auto-resizing the section.
             task.delay(TweenHelper.FastInfo.Time + 0.02, function()
                 if not self._collapsed and self.Frame and self.Frame.Parent then
                     self.Frame.AutomaticSize = Enum.AutomaticSize.Y
@@ -2174,6 +2169,20 @@ function Window.new(config: table, parentGui: ScreenGui)
     })
     ComponentHelper.AddPadding(self.TitleBar, 0, 0, 16, 16)
 
+    -- DragZone: transparent TextButton covering the draggable region of TitleBar.
+    -- Using a TextButton (not a Frame) ensures touch InputBegan is consumed by
+    -- the GUI system, preventing Roblox's camera from also receiving the touch.
+    -- Width = full bar minus DRAG_EXCLUSION (button zone) so title buttons stay hit-testable.
+    self._dragZone = ComponentHelper.Create("TextButton", {
+        Name                   = "DragZone",
+        Size                   = UDim2.new(1, -DRAG_EXCLUSION, 1, 0),
+        BackgroundTransparency = 1,
+        Text                   = "",
+        AutoButtonColor        = false,
+        ZIndex                 = 2,
+        Parent                 = self.TitleBar,
+    })
+
     self.TitleLabel = ComponentHelper.Create("TextLabel", {
         Name                   = "TitleLabel",
         Text                   = self.Name,
@@ -2241,6 +2250,23 @@ function Window.new(config: table, parentGui: ScreenGui)
         self:Close()
     end))
 
+    -- ─── Input sink ──────────────────────────────────────────────────────
+    -- Transparent TextButton covering the entire MainFrame at ZIndex 1.
+    -- Any touch/click on empty window space is consumed here instead of
+    -- falling through to the game's camera or input stack.
+    -- Interactive children (ZIndex > 1) still receive their inputs first
+    -- because Roblox gives input to the highest-ZIndex visible GuiObject
+    -- at the cursor position.
+    ComponentHelper.Create("TextButton", {
+        Name                   = "InputSink",
+        Size                   = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text                   = "",
+        AutoButtonColor        = false,
+        ZIndex                 = 1,
+        Parent                 = self.MainFrame,
+    })
+
     -- ─── Content container ───────────────────────────────────────────────
 
     self.ContentContainer = ComponentHelper.Create("Frame", {
@@ -2260,11 +2286,20 @@ function Window.new(config: table, parentGui: ScreenGui)
         Parent                 = self.ContentContainer,
     })
     ComponentHelper.AddPadding(self.SideNav, 8, 8, 8, 8)
-    ComponentHelper.Create("UIListLayout", {
+    local sideNavLayout = ComponentHelper.Create("UIListLayout", {
         SortOrder = Enum.SortOrder.LayoutOrder,
         Padding   = UDim.new(0, 4),
         Parent    = self.SideNav,
     })
+    -- Auto-resize SideNav canvas so all tabs remain reachable via scroll.
+    -- Without this the ScrollingFrame defaults to CanvasSize=(0,0) and
+    -- tabs that overflow the visible height are unreachable on mobile.
+    self._maid:GiveTask(
+        sideNavLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            self.SideNav.CanvasSize =
+                UDim2.new(0, 0, 0, sideNavLayout.AbsoluteContentSize.Y + 16)
+        end)
+    )
 
     ComponentHelper.Create("Frame", {
         Name             = "NavDivider",
@@ -2486,15 +2521,15 @@ function Window:_EnableDragging()
     local dragging  = false
     local dragStart, startPos
 
-    self._maid:GiveTask(self.TitleBar.InputBegan:Connect(function(input)
+    -- Wire to DragZone TextButton (not TitleBar Frame) so touch is consumed
+    -- by the GUI system and does not also rotate the game camera.
+    -- DRAG_EXCLUSION guard is no longer needed here because DragZone already
+    -- covers only the non-button portion of the TitleBar.
+    self._maid:GiveTask(self._dragZone.InputBegan:Connect(function(input)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then
             return
         end
-        -- Skip the button zone on the right side of the TitleBar.
-        local relX = input.Position.X - self.TitleBar.AbsolutePosition.X
-        if relX > self.TitleBar.AbsoluteSize.X - DRAG_EXCLUSION then return end
-
         dragging  = true
         dragStart = input.Position
         startPos  = self.MainFrame.Position
@@ -2954,7 +2989,12 @@ function Button.New(parent: Instance, config: table)
     end))
 
     table.insert(inputConns, triggerBtn.InputEnded:Connect(function(input)
-        if not enabled or loading then return end
+        -- Visual restore must always fire — even when loading=true.
+        -- The old guard (not enabled or loading) caused the pressed-state to
+        -- stick permanently if the callback took long or threw an error.
+        -- We still gate on 'enabled' to avoid restoring a disabled button's
+        -- size, but 'loading' must NOT block the visual recovery.
+        if not enabled then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         TweenHelper.Tween(frame, TweenHelper.FastInfo, {
@@ -3326,14 +3366,15 @@ function ColorPicker.New(parent: Instance, config: table)
     -- direction intent is confirmed. Previously draggingSV=true was set immediately
     -- on InputBegan, which intercepted every passing scroll gesture on SVSquare.
     -- Now the global InputChanged handler only updates color once committed.
-    local draggingSV    = false   -- SV drag committed (mouse or confirmed touch)
-    local draggingHue   = false   -- Hue drag committed (mouse or confirmed touch)
-    local svPending     = false   -- touch finger down on SV square, direction undecided
-    local huePending    = false   -- touch finger down on hue strip, direction undecided
-    local globalConns   = {}
-    local svTouchStart  = Vector2.zero
-    local hueTouchStart = 0
-    local SV_THRESHOLD  = 8   -- pixels before committing to a drag
+    local draggingSV      = false   -- SV drag committed (mouse or confirmed touch)
+    local draggingHue     = false   -- Hue drag committed (mouse or confirmed touch)
+    local svPending       = false   -- touch finger down on SV square, direction undecided
+    local huePending      = false   -- touch finger down on hue strip, direction undecided
+    local globalConns     = {}
+    local svTouchStart    = Vector2.zero
+    local hueTouchStart   = 0        -- Y anchor for hue strip drag
+    local hueTouchStartX  = 0        -- X anchor for hue strip horizontal-swipe cancellation
+    local SV_THRESHOLD    = 8   -- pixels before committing to a drag
 
     table.insert(globalConns, SVSquare.InputBegan:Connect(function(input)
         if not enabled then return end
@@ -3361,9 +3402,10 @@ function ColorPicker.New(parent: Instance, config: table)
             h = math.clamp(rel.Y / HueStrip.AbsoluteSize.Y, 0, 1)
             rebuildColor()
         elseif input.UserInputType == Enum.UserInputType.Touch then
-            hueTouchStart = input.Position.Y
-            huePending    = true
-            draggingHue   = false
+            hueTouchStart  = input.Position.Y
+            hueTouchStartX = input.Position.X   -- anchor X for horizontal-swipe cancellation
+            huePending     = true
+            draggingHue    = false
         end
     end))
 
@@ -3391,11 +3433,14 @@ function ColorPicker.New(parent: Instance, config: table)
         -- ── Resolve Hue pending state ─────────────────────────────────────
         if huePending and input.UserInputType == Enum.UserInputType.Touch then
             local dy = math.abs(input.Position.Y - hueTouchStart)
+            local dx = math.abs(input.Position.X - hueTouchStartX)
             if dy >= SV_THRESHOLD then
                 huePending  = false
-                draggingHue = true   -- hue strip is vertical-only, any Y motion commits
-            elseif math.abs(input.Position.X - svTouchStart.X) > SV_THRESHOLD then
-                huePending  = false  -- clear horizontal swipe — not a hue drag
+                draggingHue = true   -- hue strip is vertical-only, clear vertical motion commits
+            elseif dx > SV_THRESHOLD then
+                -- Horizontal swipe — not a hue drag; yield to page scroll
+                huePending  = false
+                draggingHue = false
             end
         end
 
@@ -3563,7 +3608,7 @@ function Divider.New(parent: Instance, config: table)
             Parent           = frame,
         })
 
-        -- Center label
+        -- Center label — padding 6px each side so text never touches the lines.
         textLabel = ComponentHelper.Create("TextLabel", {
             Name               = "Label",
             AnchorPoint        = Vector2.new(0.5, 0.5),
@@ -3578,6 +3623,18 @@ function Divider.New(parent: Instance, config: table)
             TextXAlignment     = Enum.TextXAlignment.Center,
             Parent             = frame,
         })
+
+        -- Resize lines dynamically so they never overlap the label regardless of
+        -- text length. 8px gap on each side of the label gives breathing room.
+        local GAP = 8
+        textLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            local labelHalf = textLabel.AbsoluteSize.X / 2
+            local frameW    = frame.AbsoluteSize.X
+            if frameW <= 0 then return end
+            local lineW = math.max(0, (frameW / 2) - labelHalf - GAP)
+            leftLine.Size  = UDim2.new(0, lineW, 0, 1)
+            rightLine.Size = UDim2.new(0, lineW, 0, 1)
+        end)
     end
 
     -- ─── Theme updates ───────────────────────────────────────────────────────
@@ -3732,19 +3789,42 @@ function Dropdown.New(parent: Instance, config: table)
     -- so theme changes and refreshes don't accumulate listeners on destroyed buttons.
     local optionConns = {}
 
-    -- Option list (expands below)
-    local OptionList = ComponentHelper.Create("Frame", {
-        Position           = UDim2.new(0, 8, 0, 48),
-        Size               = UDim2.new(1, -16, 0, 0),
+    -- OptionScroll wraps OptionList in a ScrollingFrame with a max height cap.
+    -- This prevents 10+ item lists from expanding the Row to absurd heights,
+    -- and critically: touch events inside the ScrollingFrame are consumed by
+    -- the scroll container and do NOT propagate to the parent PageCanvas.
+    local OPTION_ITEM_H  = 28
+    local OPTION_GAP     = 4
+    local OPTION_MAX_H   = 200   -- cap visible list height (px) on mobile
+
+    local OptionScroll = ComponentHelper.Create("ScrollingFrame", {
+        Position               = UDim2.new(0, 8, 0, 48),
+        Size                   = UDim2.new(1, -16, 0, 0),  -- height driven dynamically
         BackgroundTransparency = 1,
-        Parent             = Row,
+        BorderSizePixel        = 0,
+        ScrollBarThickness     = 3,
+        ScrollBarImageColor3   = ThemeEngine.GetToken("ScrollBar"),
+        ScrollingDirection     = Enum.ScrollingDirection.Y,
+        Parent                 = Row,
+    })
+
+    -- Option list lives inside the ScrollingFrame
+    local OptionList = ComponentHelper.Create("Frame", {
+        Size               = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Parent             = OptionScroll,
     })
 
     local UIList = ComponentHelper.Create("UIListLayout", {
         SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding   = UDim.new(0, 4),
+        Padding   = UDim.new(0, OPTION_GAP),
         Parent    = OptionList,
     })
+
+    -- Keep OptionScroll.CanvasSize in sync with content
+    UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        OptionScroll.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 4)
+    end)
 
     -- ─── Render options ────────────────────────────────────────────────────
 
@@ -3827,15 +3907,19 @@ function Dropdown.New(parent: Instance, config: table)
         isOpen = not isOpen
         TweenHelper.Tween(Arrow, TweenHelper.FastInfo, { Rotation = isOpen and 180 or 0 })
         if isOpen then
-            -- BUG-03 fix: defer one frame so Roblox resolves AbsoluteContentSize
-            -- before we read it. On mobile, layout is not synchronous with the click.
+            -- Defer one frame so AbsoluteContentSize is resolved before reading.
             task.defer(function()
-                if not isOpen then return end  -- guard: user may have closed before frame
-                local targetH = 54 + UIList.AbsoluteContentSize.Y
-                TweenHelper.Tween(Row, TweenHelper.FastInfo, { Size = UDim2.new(1, 0, 0, targetH) })
+                if not isOpen then return end
+                local contentH  = UIList.AbsoluteContentSize.Y + 4
+                local scrollH   = math.min(contentH, OPTION_MAX_H)   -- cap height
+                local totalH    = 54 + scrollH
+                -- Resize the scroll container to match capped content height
+                TweenHelper.Tween(OptionScroll, TweenHelper.FastInfo, { Size = UDim2.new(1, -16, 0, scrollH) })
+                TweenHelper.Tween(Row,          TweenHelper.FastInfo, { Size = UDim2.new(1, 0,   0, totalH)  })
             end)
         else
-            TweenHelper.Tween(Row, TweenHelper.FastInfo, { Size = UDim2.new(1, 0, 0, 42) })
+            TweenHelper.Tween(OptionScroll, TweenHelper.FastInfo, { Size = UDim2.new(1, -16, 0, 0)  })
+            TweenHelper.Tween(Row,          TweenHelper.FastInfo, { Size = UDim2.new(1, 0,   0, 42) })
         end
     end)
 
@@ -3918,7 +4002,7 @@ function Dropdown.New(parent: Instance, config: table)
         table.clear(optionConns)
         themeDisconnect()
         OnChanged:Destroy()
-        Row:Destroy()
+        Row:Destroy()   -- cascades: destroys OptionScroll + OptionList + all buttons
     end
 
     api.Instance  = Row
@@ -4050,6 +4134,20 @@ function Keybind.New(parent: Instance, config: table)
         })
     end
 
+    -- Hover states on BindBtn
+    local hoverConn1 = BindBtn.MouseEnter:Connect(function()
+        if not enabled or isListening then return end
+        TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
+            BackgroundColor3 = ThemeEngine.GetToken("SurfaceHover"),
+        })
+    end)
+    local hoverConn2 = BindBtn.MouseLeave:Connect(function()
+        if not enabled or isListening then return end
+        TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
+            BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
+        })
+    end)
+
     BindBtn.MouseButton1Click:Connect(function()
         if not enabled then return end
         -- Tapping while listening cancels on mobile (no Escape key available).
@@ -4124,6 +4222,14 @@ function Keybind.New(parent: Instance, config: table)
         TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
             TextColor3 = ThemeEngine.GetToken("Text"),
         })
+        -- Restore BindBtn to normal visual state
+        TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
+            BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
+            TextColor3       = ThemeEngine.GetToken("Text"),
+        })
+        TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
+            Color = ThemeEngine.GetToken("Border"),
+        })
     end
 
     function api:Disable()
@@ -4142,6 +4248,8 @@ function Keybind.New(parent: Instance, config: table)
     function api:Destroy()
         if globalConn then globalConn:Disconnect() end
         if timeoutThread then pcall(task.cancel, timeoutThread) end
+        hoverConn1:Disconnect()
+        hoverConn2:Disconnect()
         themeDisconnect()
         OnChanged:Destroy()
         Row:Destroy()
@@ -4338,7 +4446,9 @@ function Paragraph.New(parent: Instance, config: table)
         })
     end
 
-    -- Body text
+    -- Body text.
+    -- LineHeight 1.4 is a newer Roblox property; wrap the assignment in pcall
+    -- so older runtimes don't silently error and leave the label invisible.
     local bodyLabel = ComponentHelper.Create("TextLabel", {
         Name               = "Body",
         Size               = UDim2.new(1, 0, 0, 0),
@@ -4350,10 +4460,10 @@ function Paragraph.New(parent: Instance, config: table)
         Font               = Enum.Font.Gotham,
         TextXAlignment     = Enum.TextXAlignment.Left,
         TextWrapped        = true,
-        LineHeight         = 1.4,
         LayoutOrder        = 1,
         Parent             = frame,
     })
+    pcall(function() bodyLabel.LineHeight = 1.4 end)
 
     -- ─── Theme updates ───────────────────────────────────────────────────────
 
@@ -4523,10 +4633,11 @@ function Slider.New(parent: Instance, config: table)
 
     -- ─── Input handling (scoped connections — no global leak) ──────────────
 
-    local dragging      = false
-    local touchStartX   = 0
+    local dragging       = false
+    local touchStartX    = 0
+    local touchStartY    = 0    -- tracked alongside X for delta-based direction detection
     local touchDragReady = false  -- true once horizontal intent confirmed
-    local globalConns   = {}
+    local globalConns    = {}
 
     local function startDrag(screenX: number)
         dragging = true
@@ -4549,6 +4660,7 @@ function Slider.New(parent: Instance, config: table)
         if not enabled then return end
         if input.UserInputType == Enum.UserInputType.Touch then
             touchStartX    = input.Position.X
+            touchStartY    = input.Position.Y   -- anchor both axes from touch start
             touchDragReady = false
             dragging       = true
         end
@@ -4563,8 +4675,10 @@ function Slider.New(parent: Instance, config: table)
             applyValue(computeValue(input.Position.X), true)
 
         elseif input.UserInputType == Enum.UserInputType.Touch then
+            -- Use delta from touch *start* (not from hitArea center) so diagonal
+            -- intent detection is based on actual finger movement direction.
             local dx = math.abs(input.Position.X - touchStartX)
-            local dy = math.abs(input.Position.Y - (hitArea.AbsolutePosition.Y + hitArea.AbsoluteSize.Y / 2))
+            local dy = math.abs(input.Position.Y - touchStartY)
 
             if not touchDragReady then
                 -- Confirm horizontal intent: horizontal delta must dominate vertical
@@ -4671,10 +4785,13 @@ end
 -- ── Components.TextBox ────────────────────────────────────
 _Delirium_modules["Components.TextBox"] = function()
 -- Components/TextBox.lua
+
+local UserInputService = game:GetService("UserInputService")
 -- local Root            = script.Parent.Parent
 local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
 local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local InputAdapter    = _Delirium_require("Core.InputAdapter")
 local Signal          = _Delirium_require("Utilities.Signal")
 
 local TextBox = {}
@@ -4753,6 +4870,193 @@ function TextBox.New(parent: Instance, config: table)
     local inputStroke = ComponentHelper.AddStroke(InputBox, ThemeEngine.GetToken("Border"), 1)
     ComponentHelper.AddPadding(InputBox, 0, 0, 6, 6)
 
+    -- ─── Mobile expanded editor ────────────────────────────────────────────
+    -- On touch devices, tapping a TextBox opens a full-screen modal editor
+    -- so the user has a large comfortable editing area with Done/Cancel.
+    -- The compact InputBox becomes read-only on mobile; the editor owns text input.
+    --
+    -- Editor structure (parented to the first ScreenGui ancestor):
+    --   Backdrop (TextButton, ZIndex 500) — dims screen, click = cancel
+    --     Card (Frame, ZIndex 501)
+    --       Header label
+    --       MultilineBox (TextBox, multiline)
+    --       Button row: Cancel | Done
+
+    local _editorOpen = false
+    local _editorBackdrop = nil
+
+    local function _closeEditor(commit: boolean)
+        if not _editorOpen then return end
+        _editorOpen = false
+        if _editorBackdrop then
+            _editorBackdrop:Destroy()
+            _editorBackdrop = nil
+        end
+    end
+
+    local function _openEditor()
+        if _editorOpen then return end
+        if not InputAdapter.IsTouch then return end  -- desktop: let InputBox handle it normally
+        _editorOpen = true
+
+        -- Find the root ScreenGui to parent the overlay
+        local screenGui = Row:FindFirstAncestorWhichIsA("ScreenGui")
+        if not screenGui then
+            _editorOpen = false
+            return
+        end
+
+        -- Backdrop
+        local backdrop = ComponentHelper.Create("TextButton", {
+            Name                   = "TextBoxEditorBackdrop",
+            Size                   = UDim2.fromScale(1, 1),
+            Position               = UDim2.fromScale(0, 0),
+            BackgroundColor3       = ThemeEngine.GetToken("Overlay"),
+            BackgroundTransparency = 0.45,
+            Text                   = "",
+            AutoButtonColor        = false,
+            ZIndex                 = 500,
+            Parent                 = screenGui,
+        })
+        _editorBackdrop = backdrop
+
+        -- Card
+        local CARD_W = math.min(screenGui.AbsoluteSize.X - 32, 420)
+        local card = ComponentHelper.Create("Frame", {
+            Name             = "TextBoxEditorCard",
+            Size             = UDim2.fromOffset(CARD_W, 260),
+            AnchorPoint      = Vector2.new(0.5, 0.5),
+            Position         = UDim2.fromScale(0.5, 0.42),  -- slightly above center; keyboard sits below
+            BackgroundColor3 = ThemeEngine.GetToken("Surface"),
+            BorderSizePixel  = 0,
+            ZIndex           = 501,
+            Parent           = backdrop,
+        })
+        ComponentHelper.AddCorner(card, 10)
+        ComponentHelper.AddStroke(card, ThemeEngine.GetToken("Border"), 1)
+        ComponentHelper.AddPadding(card, 14, 14, 14, 14)
+
+        -- Header
+        ComponentHelper.Create("TextLabel", {
+            Name               = "Header",
+            Size               = UDim2.new(1, 0, 0, 20),
+            BackgroundTransparency = 1,
+            Text               = title,
+            TextColor3         = ThemeEngine.GetToken("Text"),
+            TextSize           = 13,
+            Font               = Enum.Font.GothamBold,
+            TextXAlignment     = Enum.TextXAlignment.Left,
+            ZIndex             = 502,
+            Parent             = card,
+        })
+
+        -- Multiline editor box
+        local editorBox = ComponentHelper.Create("TextBox", {
+            Name               = "EditorBox",
+            Position           = UDim2.new(0, 0, 0, 30),
+            Size               = UDim2.new(1, 0, 1, -80),
+            BackgroundColor3   = ThemeEngine.GetToken("InputBackground"),
+            Text               = InputBox.Text,
+            PlaceholderText    = placeholder,
+            PlaceholderColor3  = ThemeEngine.GetToken("SubText"),
+            TextColor3         = ThemeEngine.GetToken("Text"),
+            TextSize           = 13,
+            Font               = Enum.Font.Gotham,
+            TextXAlignment     = Enum.TextXAlignment.Left,
+            TextYAlignment     = Enum.TextYAlignment.Top,
+            TextWrapped        = true,
+            MultiLine          = true,
+            ClearTextOnFocus   = false,
+            TextEditable       = enabled,
+            ZIndex             = 502,
+            Parent             = card,
+        })
+        ComponentHelper.AddCorner(editorBox, 6)
+        ComponentHelper.AddStroke(editorBox, ThemeEngine.GetToken("Accent"), 1)
+        ComponentHelper.AddPadding(editorBox, 8, 8, 8, 8)
+
+        -- Button row
+        local btnRow = ComponentHelper.Create("Frame", {
+            Name               = "BtnRow",
+            Position           = UDim2.new(0, 0, 1, -38),
+            Size               = UDim2.new(1, 0, 0, 36),
+            BackgroundTransparency = 1,
+            ZIndex             = 502,
+            Parent             = card,
+        })
+        ComponentHelper.AddListLayout(btnRow, {
+            FillDirection       = Enum.FillDirection.Horizontal,
+            HorizontalAlignment = Enum.HorizontalAlignment.Right,
+            VerticalAlignment   = Enum.VerticalAlignment.Center,
+            Padding             = UDim.new(0, 8),
+        })
+
+        local cancelBtn = ComponentHelper.Create("TextButton", {
+            Name             = "Cancel",
+            Size             = UDim2.fromOffset(80, 32),
+            BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
+            AutoButtonColor  = false,
+            Text             = "Cancel",
+            TextColor3       = ThemeEngine.GetToken("SubText"),
+            TextSize         = 12,
+            Font             = Enum.Font.GothamBold,
+            LayoutOrder      = 1,
+            ZIndex           = 503,
+            Parent           = btnRow,
+        })
+        ComponentHelper.AddCorner(cancelBtn, 6)
+
+        local doneBtn = ComponentHelper.Create("TextButton", {
+            Name             = "Done",
+            Size             = UDim2.fromOffset(80, 32),
+            BackgroundColor3 = ThemeEngine.GetToken("Accent"),
+            AutoButtonColor  = false,
+            Text             = "Done",
+            TextColor3       = ThemeEngine.GetToken("AccentText"),
+            TextSize         = 12,
+            Font             = Enum.Font.GothamBold,
+            LayoutOrder      = 2,
+            ZIndex           = 503,
+            Parent           = btnRow,
+        })
+        ComponentHelper.AddCorner(doneBtn, 6)
+
+        -- Focus the editor immediately
+        task.defer(function()
+            if editorBox and editorBox.Parent then
+                editorBox:CaptureFocus()
+            end
+        end)
+
+        -- Cancel: discard changes
+        backdrop.MouseButton1Click:Connect(function()
+            _closeEditor(false)
+        end)
+        cancelBtn.MouseButton1Click:Connect(function()
+            _closeEditor(false)
+        end)
+
+        -- Done: commit text to InputBox and fire signals
+        doneBtn.MouseButton1Click:Connect(function()
+            local text = editorBox.Text
+            InputBox.Text = text
+            _closeEditor(true)
+            OnChanged:Fire(text)
+            OnSubmit:Fire(text)
+        end)
+
+        -- Also commit on Enter (hardware keyboard connected to touch device)
+        editorBox.FocusLost:Connect(function(enterPressed)
+            if enterPressed then
+                local text = editorBox.Text
+                InputBox.Text = text
+                _closeEditor(true)
+                OnChanged:Fire(text)
+                OnSubmit:Fire(text)
+            end
+        end)
+    end
+
     -- ─── Focus animations ──────────────────────────────────────────────────
 
     -- BUG-05 fix: scroll the parent PageCanvas so the TextBox stays visible
@@ -4789,6 +5093,13 @@ function TextBox.New(parent: Instance, config: table)
     InputBox.Focused:Connect(function()
         if not enabled then
             InputBox:ReleaseFocus()
+            return
+        end
+        -- On touch: release InputBox focus immediately and open expanded editor.
+        -- The expanded editor owns all text input; the compact box is display-only.
+        if InputAdapter.IsTouch then
+            InputBox:ReleaseFocus()
+            _openEditor()
             return
         end
         TweenHelper.Tween(inputStroke, TweenHelper.FastInfo, {
@@ -4877,6 +5188,7 @@ function TextBox.New(parent: Instance, config: table)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        _closeEditor(false)   -- dismiss expanded editor if open
         themeDisconnect()
         OnChanged:Destroy()
         OnSubmit:Destroy()
@@ -5470,8 +5782,11 @@ local function _buildDialog(config: table)
 
     local accentToken = TYPE_TOKEN[dialogType] or "Accent"
 
-    -- Card height: title row + optional message row + action row (36px tall) + padding
-    local cardH = hasMessage and 138 or 116
+    -- Card uses AutomaticSize.Y so long messages expand the card naturally.
+    -- A max height is clamped via UISizeConstraint so it never overflows the screen.
+    -- The message area is a ScrollingFrame so very long text stays usable.
+    local MSG_MAX_H = 160   -- max scrollable message area height
+    local cardH     = nil   -- unused now (AutomaticSize drives height)
 
     -- ─── Backdrop ─────────────────────────────────────────────────────────────
     -- Clickable if cancel is available so clicking outside dismisses the dialog.
@@ -5496,28 +5811,49 @@ local function _buildDialog(config: table)
 
     local card = ComponentHelper.Create("Frame", {
         Name                   = "DialogCard",
-        Size                   = UDim2.fromOffset(CARD_W, cardH),
+        Size                   = UDim2.fromOffset(CARD_W, 0),
+        AutomaticSize          = Enum.AutomaticSize.Y,
         AnchorPoint            = Vector2.new(0.5, 0.5),
         Position               = UDim2.fromScale(0.5, 0.5),
         BackgroundColor3       = ThemeEngine.GetToken("Surface"),
         BackgroundTransparency = 1,   -- animated in
         BorderSizePixel        = 0,
+        ClipsDescendants       = false,
         ZIndex                 = 201,
         Parent                 = backdrop,
     })
     ComponentHelper.AddCorner(card, 10)
+    -- Clamp max height to 80% of screen so the dialog never overflows on small phones
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    ComponentHelper.Create("UISizeConstraint", {
+        MaxSize = Vector2.new(CARD_W, math.floor(vp.Y * 0.80)),
+        Parent  = card,
+    })
+    ComponentHelper.AddPadding(card, 14, 14, 16, 16)
+    ComponentHelper.Create("UIListLayout", {
+        SortOrder        = Enum.SortOrder.LayoutOrder,
+        Padding          = UDim.new(0, 10),
+        HorizontalAlignment = Enum.HorizontalAlignment.Left,
+        VerticalAlignment   = Enum.VerticalAlignment.Top,
+        Parent           = card,
+    })
     -- BUG-C fix: start stroke fully transparent so it fades in with the card
     -- instead of popping visible while the card's BackgroundTransparency is still 1.
     local cardStroke = ComponentHelper.AddStroke(card, ThemeEngine.GetToken("Border"), 1)
     cardStroke.Transparency = 1  -- animated to 0 in Confirm()
 
-    -- Colored left bar (4px, same pattern as NotificationService)
+    -- Layout-order children flow vertically via the card's UIListLayout.
+    -- This replaces fixed Position-based layout so content expands naturally.
+
+    -- Colored left bar is now a thin top accent band instead of a side bar,
+    -- compatible with the vertical flow layout.
     local typeBar = ComponentHelper.Create("Frame", {
         Name             = "TypeBar",
-        Size             = UDim2.new(0, 4, 1, 0),
-        Position         = UDim2.fromScale(0, 0),
+        Size             = UDim2.new(1, 0, 0, 3),
         BackgroundColor3 = ThemeEngine.GetToken(accentToken),
         BorderSizePixel  = 0,
+        LayoutOrder      = 0,
         ZIndex           = 202,
         Parent           = card,
     })
@@ -5526,26 +5862,41 @@ local function _buildDialog(config: table)
     -- Title
     local titleLabel = ComponentHelper.Create("TextLabel", {
         Name                   = "Title",
-        Size                   = UDim2.new(1, -36, 0, 16),
-        Position               = UDim2.fromOffset(20, 14),
+        Size                   = UDim2.new(1, 0, 0, 0),
+        AutomaticSize          = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
         Text                   = title,
         TextColor3             = ThemeEngine.GetToken("Text"),
         TextSize               = 13,
         Font                   = Enum.Font.GothamBold,
         TextXAlignment         = Enum.TextXAlignment.Left,
-        TextTruncate           = Enum.TextTruncate.AtEnd,
+        TextWrapped            = true,
+        LayoutOrder            = 1,
         ZIndex                 = 202,
         Parent                 = card,
     })
 
-    -- Message (optional)
+    -- Message (optional) — in a ScrollingFrame capped at MSG_MAX_H
     local messageLabel
+    local msgScroll
     if hasMessage then
+        -- Measure approximate natural height with a throwaway label
+        msgScroll = ComponentHelper.Create("ScrollingFrame", {
+            Name               = "MessageScroll",
+            Size               = UDim2.new(1, 0, 0, MSG_MAX_H),  -- will be shrunk if short
+            BackgroundTransparency = 1,
+            BorderSizePixel    = 0,
+            ScrollBarThickness = 3,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            LayoutOrder        = 2,
+            ZIndex             = 202,
+            Parent             = card,
+        })
+
         messageLabel = ComponentHelper.Create("TextLabel", {
             Name                   = "Message",
-            Size                   = UDim2.new(1, -36, 0, 28),
-            Position               = UDim2.fromOffset(20, 34),
+            Size                   = UDim2.new(1, -4, 0, 0),
+            AutomaticSize          = Enum.AutomaticSize.Y,
             BackgroundTransparency = 1,
             Text                   = message,
             TextColor3             = ThemeEngine.GetToken("SubText"),
@@ -5554,16 +5905,24 @@ local function _buildDialog(config: table)
             TextXAlignment         = Enum.TextXAlignment.Left,
             TextWrapped            = true,
             ZIndex                 = 202,
-            Parent                 = card,
+            Parent                 = msgScroll,
         })
+
+        -- Shrink scroll area to natural text height when it's short
+        messageLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            local naturalH = messageLabel.AbsoluteSize.Y
+            local cappedH  = math.min(naturalH + 4, MSG_MAX_H)
+            msgScroll.Size           = UDim2.new(1, 0, 0, cappedH)
+            msgScroll.CanvasSize     = UDim2.new(0, 0, 0, naturalH + 4)
+        end)
     end
 
-    -- Action row — anchored to bottom of card (36px tall for touch)
+    -- Action row — flows at the bottom via UIListLayout (36px tall for touch)
     local actionRow = ComponentHelper.Create("Frame", {
         Name                   = "ActionRow",
-        Size                   = UDim2.new(1, -32, 0, 36),
-        Position               = UDim2.new(0, 16, 1, -50),
+        Size                   = UDim2.new(1, 0, 0, 36),
         BackgroundTransparency = 1,
+        LayoutOrder            = 3,
         ZIndex                 = 202,
         Parent                 = card,
     })
@@ -5720,11 +6079,11 @@ function DialogService.Confirm(config: table)
     AnimationEngine.Play(backdrop, TweenHelper.DefaultInfo,
         { BackgroundTransparency = BACKDROP_ALPHA }, "dlg_bg")
 
-    -- Animate card in (FadeIn + Pop run in parallel via different keys).
-    -- BUG-C fix: also fade the UIStroke in so it doesn't pop before the
-    -- card background has faded in. cardStroke.Transparency starts at 1.
+    -- Animate card in: FadeIn + SlideIn from bottom (mild).
+    -- We avoid Pop() here because the card uses AutomaticSize.Y —
+    -- Pop() snaps Size before tweening and would fight AutomaticSize.
     AnimationEngine.FadeIn(card, 1, TweenHelper.DefaultInfo)
-    AnimationEngine.Pop(card, 0.88, AnimationEngine.Preset.Spring)
+    AnimationEngine.SlideIn(card, "Bottom", 14, TweenHelper.SmoothInfo)
     AnimationEngine.Play(cardStroke, TweenHelper.DefaultInfo,
         { Transparency = 0 }, "fade")
 
@@ -5826,16 +6185,37 @@ function NotificationService.Init(screenGui: ScreenGui)
     local topInset   = math.max(topLeft.Y,    MARGIN)
     local rightInset = math.max(bottomRight.X, MARGIN)
 
-    _container = ComponentHelper.Create("Frame", {
-        Name            = "DeliriumNotifications",
-        AnchorPoint     = Vector2.new(1, 0),
-        Position        = UDim2.new(1, -rightInset, 0, topInset),
-        Size            = UDim2.new(0, NOTIF_WIDTH, 1, -(topInset + MARGIN)),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ZIndex          = 100,
-        Parent          = screenGui,
-    })
+    -- On very narrow viewports (< 420px wide) switch to full-width centered
+    -- layout at the top of the screen. Avoids a tiny right-edge sliver that's
+    -- hard to read on small phones while still respecting the safe area.
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local isNarrow = vp.X < 420
+
+    if isNarrow then
+        -- Full-width, center-anchored, top of screen
+        _container = ComponentHelper.Create("Frame", {
+            Name            = "DeliriumNotifications",
+            AnchorPoint     = Vector2.new(0.5, 0),
+            Position        = UDim2.new(0.5, 0, 0, topInset),
+            Size            = UDim2.new(1, -(MARGIN * 2), 1, -(topInset + MARGIN)),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ZIndex          = 100,
+            Parent          = screenGui,
+        })
+    else
+        _container = ComponentHelper.Create("Frame", {
+            Name            = "DeliriumNotifications",
+            AnchorPoint     = Vector2.new(1, 0),
+            Position        = UDim2.new(1, -rightInset, 0, topInset),
+            Size            = UDim2.new(0, NOTIF_WIDTH, 1, -(topInset + MARGIN)),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ZIndex          = 100,
+            Parent          = screenGui,
+        })
+    end
 
     ComponentHelper.Create("UIListLayout", {
         SortOrder        = Enum.SortOrder.LayoutOrder,
@@ -6279,7 +6659,7 @@ local _runtime, _gui = Bootstrap()
 -- ─── Delirium Public API ───────────────────────────────────────────────────
 
 local Delirium = {
-    Version = "1.0.0",
+    Version = "1.1.0",
 }
 
 function Delirium:CreateWindow(config: table)
@@ -6321,5 +6701,6 @@ end
 -- Expose sub-modules for advanced use
 Delirium.Theme     = ThemeEngine
 Delirium.Animation = AnimationEngine
+Delirium.Dialog    = DialogService
 
 return Delirium
