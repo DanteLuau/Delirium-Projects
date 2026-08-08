@@ -6324,6 +6324,3 @@ Delirium.Theme     = ThemeEngine
 Delirium.Animation = AnimationEngine
 
 return Delirium
-git add dist/Delirium.lua Init.lua
-git commit -m "Fix LocalPlayer nil check in Init"
-git push origin main
