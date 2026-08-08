@@ -1572,23 +1572,22 @@ _Delirium_modules["Layout.Section"] = function()
 -- Layout/Section.lua
 -- Owns its component handles. Cascade: Section:Destroy() → Component:Destroy()
 -- Idempotent: multiple :Destroy() calls are safe.
+-- local Root            = script.Parent.Parent
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local Maid            = _Delirium_require("Core.Maid")
 
-local Root            = script.Parent.Parent
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local Maid            = require(Root.Core.Maid)
-
-local Button      = require(Root.Components.Button)
-local Toggle      = require(Root.Components.Toggle)
-local Slider      = require(Root.Components.Slider)
-local TextBox     = require(Root.Components.TextBox)
-local Dropdown    = require(Root.Components.Dropdown)
-local Keybind     = require(Root.Components.Keybind)
-local ColorPicker = require(Root.Components.ColorPicker)
-local Label       = require(Root.Components.Label)
-local Paragraph   = require(Root.Components.Paragraph)
-local Divider     = require(Root.Components.Divider)
+local Button      = _Delirium_require("Components.Button")
+local Toggle      = _Delirium_require("Components.Toggle")
+local Slider      = _Delirium_require("Components.Slider")
+local TextBox     = _Delirium_require("Components.TextBox")
+local Dropdown    = _Delirium_require("Components.Dropdown")
+local Keybind     = _Delirium_require("Components.Keybind")
+local ColorPicker = _Delirium_require("Components.ColorPicker")
+local Label       = _Delirium_require("Components.Label")
+local Paragraph   = _Delirium_require("Components.Paragraph")
+local Divider     = _Delirium_require("Components.Divider")
 
 local Section = {}
 Section.__index = Section
@@ -1894,12 +1893,11 @@ _Delirium_modules["Layout.Tab"] = function()
 -- Layout/Tab.lua
 -- Owns its Sections. Cascade: Tab:Destroy() → Section:Destroy() → Component:Destroy()
 -- Idempotent: multiple :Destroy() calls are safe.
-
-local Root            = script.Parent.Parent
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local Maid            = require(Root.Core.Maid)
+-- local Root            = script.Parent.Parent
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local Maid            = _Delirium_require("Core.Maid")
 local Section         = _Delirium_require("Layout.Section")
 
 local Tab = {}
@@ -2100,13 +2098,13 @@ _Delirium_modules["Layout.Window"] = function()
 
 local UserInputService  = game:GetService("UserInputService")
 local GuiService        = game:GetService("GuiService")
-local Root              = script.Parent.Parent
-local ThemeEngine       = require(Root.Core.ThemeEngine)
-local AnimationEngine   = require(Root.Core.AnimationEngine)
-local TweenHelper       = require(Root.Utilities.TweenHelper)
-local ComponentHelper   = require(Root.Utilities.ComponentHelper)
-local Maid              = require(Root.Core.Maid)
-local DialogService     = require(Root.Services.DialogService)
+-- local Root              = script.Parent.Parent
+local ThemeEngine       = _Delirium_require("Core.ThemeEngine")
+local AnimationEngine   = _Delirium_require("Core.AnimationEngine")
+local TweenHelper       = _Delirium_require("Utilities.TweenHelper")
+local ComponentHelper   = _Delirium_require("Utilities.ComponentHelper")
+local Maid              = _Delirium_require("Core.Maid")
+local DialogService     = _Delirium_require("Services.DialogService")
 local Tab               = _Delirium_require("Layout.Tab")
 
 local TITLEBAR_H     = 45
@@ -2788,11 +2786,11 @@ _Delirium_modules["Components.Button"] = function()
 -- Wraps async callbacks automatically: starts loading on click, success state on return.
 
 local TweenService = game:GetService("TweenService")
-local Root          = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local Signal          = require(Root.Utilities.Signal)
+-- local Root          = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Signal          = _Delirium_require("Utilities.Signal")
 
 local Button = {}
 
@@ -3082,11 +3080,11 @@ _Delirium_modules["Components.ColorPicker"] = function()
 -- Hue strip + SV gradient square + hex preview.
 
 local UserInputService = game:GetService("UserInputService")
-local Root             = script.Parent.Parent
-local ComponentHelper  = require(Root.Utilities.ComponentHelper)
-local TweenHelper      = require(Root.Utilities.TweenHelper)
-local ThemeEngine      = require(Root.Core.ThemeEngine)
-local Signal           = require(Root.Utilities.Signal)
+-- local Root             = script.Parent.Parent
+local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
+local Signal           = _Delirium_require("Utilities.Signal")
 
 local ColorPicker = {}
 
@@ -3511,11 +3509,10 @@ _Delirium_modules["Components.Divider"] = function()
 -- Usage:
 --   Section:CreateDivider()
 --   Section:CreateDivider({ Label = "Advanced" })
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
 
 local Divider = {}
 
@@ -3615,12 +3612,11 @@ end
 _Delirium_modules["Components.Dropdown"] = function()
 -- Components/Dropdown.lua
 -- Accordion-style dropdown with multi-select support.
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local Signal          = require(Root.Utilities.Signal)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Signal          = _Delirium_require("Utilities.Signal")
 
 local Dropdown = {}
 
@@ -3938,12 +3934,12 @@ _Delirium_modules["Components.Keybind"] = function()
 -- Auto-cancel after 6s on touch devices so the component never stays stuck.
 
 local UserInputService = game:GetService("UserInputService")
-local Root             = script.Parent.Parent
-local ComponentHelper  = require(Root.Utilities.ComponentHelper)
-local TweenHelper      = require(Root.Utilities.TweenHelper)
-local ThemeEngine      = require(Root.Core.ThemeEngine)
-local InputAdapter     = require(Root.Core.InputAdapter)
-local Signal           = require(Root.Utilities.Signal)
+-- local Root             = script.Parent.Parent
+local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
+local InputAdapter     = _Delirium_require("Core.InputAdapter")
+local Signal           = _Delirium_require("Utilities.Signal")
 
 local Keybind = {}
 
@@ -4167,11 +4163,10 @@ _Delirium_modules["Components.Label"] = function()
 --   Section:CreateLabel({ Title = "Version",  Value = "1.0.0" })
 --   Section:CreateLabel({ Title = "Status",   Value = "Active",  Variant = "positive" })
 --   Section:CreateLabel({ Title = "Notice",   Value = "Low HP",  Variant = "warning"  })
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
 
 local VARIANT_TOKEN = {
     default  = "SubText",
@@ -4285,11 +4280,10 @@ _Delirium_modules["Components.Paragraph"] = function()
 --       Title = "About",  -- optional
 --       Content = "Long text that wraps across multiple lines...",
 --   })
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
 
 local Paragraph = {}
 
@@ -4410,11 +4404,11 @@ _Delirium_modules["Components.Slider"] = function()
 -- preventing accidental activation during scroll gestures.
 
 local UserInputService = game:GetService("UserInputService")
-local Root             = script.Parent.Parent
-local ComponentHelper  = require(Root.Utilities.ComponentHelper)
-local TweenHelper      = require(Root.Utilities.TweenHelper)
-local ThemeEngine      = require(Root.Core.ThemeEngine)
-local Signal           = require(Root.Utilities.Signal)
+-- local Root             = script.Parent.Parent
+local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
+local Signal           = _Delirium_require("Utilities.Signal")
 
 local Slider = {}
 
@@ -4673,12 +4667,11 @@ end
 -- ── Components.TextBox ────────────────────────────────────
 _Delirium_modules["Components.TextBox"] = function()
 -- Components/TextBox.lua
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local Signal          = require(Root.Utilities.Signal)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Signal          = _Delirium_require("Utilities.Signal")
 
 local TextBox = {}
 
@@ -4900,12 +4893,11 @@ end
 -- ── Components.Toggle ─────────────────────────────────────
 _Delirium_modules["Components.Toggle"] = function()
 -- Components/Toggle.lua
-
-local Root            = script.Parent.Parent
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local Signal          = require(Root.Utilities.Signal)
+-- local Root            = script.Parent.Parent
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Signal          = _Delirium_require("Utilities.Signal")
 
 local Toggle = {}
 
@@ -5411,13 +5403,12 @@ _Delirium_modules["Services.DialogService"] = function()
 --       -- Cancel = nil → no cancel button; backdrop click does nothing
 --   })
 --   handle:Dismiss()  -- programmatic dismiss (fires Cancel.Callback if set)
-
-local Root            = script.Parent.Parent
-local ThemeEngine     = require(Root.Core.ThemeEngine)
-local AnimationEngine = require(Root.Core.AnimationEngine)
-local ComponentHelper = require(Root.Utilities.ComponentHelper)
-local TweenHelper     = require(Root.Utilities.TweenHelper)
-local ServiceRegistry = require(Root.Core.ServiceRegistry)
+-- local Root            = script.Parent.Parent
+local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local AnimationEngine = _Delirium_require("Core.AnimationEngine")
+local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
+local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
+local ServiceRegistry = _Delirium_require("Core.ServiceRegistry")
 
 -- ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -5769,10 +5760,10 @@ _Delirium_modules["Services.NotificationService"] = function()
 
 local TweenService     = game:GetService("TweenService")
 local GuiService       = game:GetService("GuiService")
-local Root             = script.Parent.Parent
-local ThemeEngine      = require(Root.Core.ThemeEngine)
-local AnimationEngine  = require(Root.Core.AnimationEngine)
-local ComponentHelper  = require(Root.Utilities.ComponentHelper)
+-- local Root             = script.Parent.Parent
+local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
+local AnimationEngine  = _Delirium_require("Core.AnimationEngine")
+local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
 
 -- ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -6152,7 +6143,7 @@ end
 
 -- ─── Self-register ────────────────────────────────────────────────────────────
 
-local ServiceRegistry = require(Root.Core.ServiceRegistry)
+local ServiceRegistry = _Delirium_require("Core.ServiceRegistry")
 
 ServiceRegistry.Register("NotificationService", {
     Reset = NotificationService.Reset,
