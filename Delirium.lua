@@ -6196,9 +6196,10 @@ local GUI_NAME    = "DeliriumUI"
 -- ─── Helpers ───────────────────────────────────────────────────────────────
 
 local function _nukeExistingGui()
+    local playerGui = Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui")
     local parents = {
         CoreGui,
-        Players.LocalPlayer:FindFirstChild("PlayerGui"),
+        playerGui,
     }
     for _, parent in ipairs(parents) do
         if parent then
@@ -6219,7 +6220,16 @@ local function _createGui(): ScreenGui
     gui.IgnoreGuiInset  = true   -- cover full screen incl. topbar area; avoids backdrop gap
     local ok = pcall(function() gui.Parent = CoreGui end)
     if not ok then
-        gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+        local lp = Players.LocalPlayer
+        if not lp then
+            pcall(function()
+                lp = Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
+            end)
+            lp = lp or Players.LocalPlayer
+        end
+        if lp then
+            gui.Parent = lp:WaitForChild("PlayerGui")
+        end
     end
     return gui
 end
@@ -6314,3 +6324,6 @@ Delirium.Theme     = ThemeEngine
 Delirium.Animation = AnimationEngine
 
 return Delirium
+git add dist/Delirium.lua Init.lua
+git commit -m "Fix LocalPlayer nil check in Init"
+git push origin main
