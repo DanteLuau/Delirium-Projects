@@ -1441,7 +1441,10 @@ end
 function ServiceRegistry.ResetAll()
     for _, entry in ipairs(_registry) do
         if type(entry.hooks.Reset) == "function" then
-            pcall(entry.hooks.Reset)
+            local ok, err = pcall(entry.hooks.Reset)
+            if not ok then
+                warn(string.format("[ServiceRegistry] Error resetting service '%s': %s", tostring(entry.name), tostring(err)))
+            end
         end
     end
 end
@@ -1451,7 +1454,10 @@ end
 function ServiceRegistry.InitAll(gui: ScreenGui)
     for _, entry in ipairs(_registry) do
         if type(entry.hooks.Init) == "function" then
-            pcall(entry.hooks.Init, gui)
+            local ok, err = pcall(entry.hooks.Init, gui)
+            if not ok then
+                warn(string.format("[ServiceRegistry] Error initializing service '%s': %s", tostring(entry.name), tostring(err)))
+            end
         end
     end
 end
@@ -6554,10 +6560,45 @@ local _screenGui:  ScreenGui = nil
 local _activeDialog          = nil
 local _initialized           = false
 
+-- ─── Helper for finding root ScreenGui ───────────────────────────────────────
+
+local function _findScreenGui(): ScreenGui?
+    local CoreGui = game:GetService("CoreGui")
+    local Players = game:GetService("Players")
+    local gui = CoreGui:FindFirstChild("DeliriumUI")
+    if not gui and Players.LocalPlayer then
+        local playerGui = Players.LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            gui = playerGui:FindFirstChild("DeliriumUI")
+        end
+    end
+    return gui
+end
+
+local function _ensureInit(): boolean
+    if _initialized and _screenGui and _screenGui.Parent then
+        return true
+    end
+    _initialized = false
+    _screenGui   = nil
+
+    local gui = _findScreenGui()
+    if gui then
+        DialogService.Init(gui)
+        return _initialized and _screenGui ~= nil and _screenGui.Parent ~= nil
+    end
+    return false
+end
+
 -- ─── Init / Reset ─────────────────────────────────────────────────────────────
 
 function DialogService.Init(screenGui: ScreenGui)
-    if _initialized then return end
+    if not screenGui then
+        screenGui = _findScreenGui()
+    end
+    if not screenGui then return end
+    if _initialized and _screenGui and _screenGui.Parent then return end
+
     _screenGui   = screenGui
     _initialized = true
 end
@@ -6877,8 +6918,13 @@ end
 -- Show a modal confirmation dialog. Returns a handle with :Dismiss().
 -- Only one dialog can be active at a time.
 function DialogService.Confirm(config: table)
-    assert(_initialized,
-        "DialogService.Init(screenGui) must be called before Confirm()")
+    if not _initialized or not _screenGui or not _screenGui.Parent then
+        _ensureInit()
+    end
+    if not _initialized or not _screenGui or not _screenGui.Parent then
+        warn("[DialogService] Cannot Confirm: Service is not initialized and ScreenGui could not be found.")
+        return nil
+    end
     assert(type(config) == "table",
         "DialogService.Confirm expects a config table")
 
@@ -7012,11 +7058,46 @@ local _queue:     table    = {}    -- waiting notifications (overflow)
 local _visible:   table    = {}    -- currently shown notification handles
 local _initialized         = false
 
+-- ─── Helper for finding root ScreenGui ───────────────────────────────────────
+
+local function _findScreenGui(): ScreenGui?
+    local CoreGui = game:GetService("CoreGui")
+    local Players = game:GetService("Players")
+    local gui = CoreGui:FindFirstChild("DeliriumUI")
+    if not gui and Players.LocalPlayer then
+        local playerGui = Players.LocalPlayer:FindFirstChild("PlayerGui")
+        if playerGui then
+            gui = playerGui:FindFirstChild("DeliriumUI")
+        end
+    end
+    return gui
+end
+
+local function _ensureInit(): boolean
+    if _initialized and _container and _container.Parent then
+        return true
+    end
+    _initialized = false
+    _container   = nil
+
+    local gui = _findScreenGui()
+    if gui then
+        NotificationService.Init(gui)
+        return _initialized and _container ~= nil and _container.Parent ~= nil
+    end
+    return false
+end
+
 -- ─── Initialization ───────────────────────────────────────────────────────────
 
 -- Must be called once with the root ScreenGui before any Push calls.
 function NotificationService.Init(screenGui: ScreenGui)
-    if _initialized then return end
+    if not screenGui then
+        screenGui = _findScreenGui()
+    end
+    if not screenGui then return end
+
+    if _initialized and _container and _container.Parent then return end
     _initialized = true
 
     -- Recompute width at init time (camera may not have been ready at module load).
@@ -7024,15 +7105,17 @@ function NotificationService.Init(screenGui: ScreenGui)
 
     -- Respect platform safe area: top inset pushes notifications below the
     -- Roblox topbar / notch; right inset keeps them away from the edge.
-    local topLeft, bottomRight = GuiService:GetGuiInset()
+    local success, topLeft, bottomRight = pcall(GuiService.GetGuiInset, GuiService)
+    if not success or not topLeft or typeof(topLeft) ~= "Vector2" then
+        topLeft, bottomRight = Vector2.new(0, 36), Vector2.new(0, 0)
+    end
     local topInset   = math.max(topLeft.Y,    MARGIN)
     local rightInset = math.max(bottomRight.X, MARGIN)
 
-    -- On narrow viewports (< 420px wide) use a compact right-anchored toast
-    -- at fixed 220px wide. Avoids the old full-width layout that blocked the
-    -- entire UI window on small phones. The right-anchor keeps it discoverable
-    -- without overlapping the SideNav on the left side of the Delirium window.
-    -- Desktop/tablet keeps the original right-anchored behaviour.
+    if _container and _container.Parent then
+        return
+    end
+
     _container = ComponentHelper.Create("Frame", {
         Name            = "DeliriumNotifications",
         AnchorPoint     = Vector2.new(1, 0),
@@ -7411,8 +7494,18 @@ end
 
 -- Push a notification. Returns a handle with :Dismiss(), :SetTitle(), :SetMessage().
 function NotificationService.Push(config: table)
-    assert(_initialized,
-        "NotificationService.Init(screenGui) must be called before Push()")
+    if not _initialized or not _container or not _container.Parent then
+        _ensureInit()
+    end
+    if not _initialized or not _container or not _container.Parent then
+        warn("[NotificationService] Cannot Push notification: Service is not initialized and ScreenGui could not be found.")
+        return {
+            Dismiss = function() end,
+            SetTitle = function() end,
+            SetMessage = function() end,
+            Destroy = function() end,
+        }
+    end
     assert(type(config) == "table", "NotificationService.Push expects a config table")
 
     local handle = _buildHandle(config)
