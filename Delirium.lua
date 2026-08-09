@@ -7546,7 +7546,12 @@ function NotificationService.Reset()
     local snapshot = {table.unpack(_visible)}
     table.clear(_visible)
     for _, h in ipairs(snapshot) do
-        pcall(function() h:Dismiss() end)
+        pcall(function()
+            h._alive = false
+            if h._frame and h._frame.Parent then
+                h._frame:Destroy()
+            end
+        end)
     end
     _container   = nil
     _initialized = false
@@ -7578,16 +7583,19 @@ local NotificationService = _Delirium_require("Services.NotificationService")
 
 local UnloadService = {}
 
-local _maid       = Maid.new()
-local _unloading  = false
-local _runtimeRef = nil
+local _maid        = Maid.new()
+local _unloading   = false
+local _runtimeRef  = nil
+local _unloadToken = 0
 
 function UnloadService.Init(_, runtime)
+    _unloadToken += 1  -- invalidate any pending background teardowns from previous session
     _runtimeRef = runtime
     _unloading  = false
 end
 
 function UnloadService.Reset()
+    _unloadToken += 1
     pcall(function() _maid:DoCleaning() end)
     _maid       = Maid.new()
     _unloading  = false
@@ -7607,13 +7615,17 @@ function UnloadService.Unload(config: table?)
     if _unloading then return end
     _unloading = true
 
+    _unloadToken += 1
+    local currentToken  = _unloadToken
+    local targetRuntime = _runtimeRef
+
     config = config or {}
     local duration = config.Duration or 2.0
     local silent   = config.Silent == true
 
     -- 1. Smoothly animate active windows closing (CanvasGroup GroupTransparency fade + slide down)
-    if _runtimeRef and _runtimeRef._windows then
-        local snapshot = {table.unpack(_runtimeRef._windows)}
+    if targetRuntime and targetRuntime._windows then
+        local snapshot = {table.unpack(targetRuntime._windows)}
         for _, win in ipairs(snapshot) do
             pcall(function()
                 if win.MainFrame and win.MainFrame.Parent then
@@ -7632,13 +7644,19 @@ function UnloadService.Unload(config: table?)
     NotificationService.DismissAll(true)
 
     local function _executeTeardown()
+        if _unloadToken ~= currentToken then
+            -- A new session was started before this teardown completed; guard against wiping new session.
+            return
+        end
         pcall(function() _maid:DoCleaning() end)
         pcall(function() NotificationService.Reset() end)
-        if _runtimeRef then
-            pcall(function() _runtimeRef:Destroy() end)
-            _runtimeRef = nil
+        if targetRuntime and type(targetRuntime.IsAlive) == "function" and targetRuntime:IsAlive() then
+            pcall(function() targetRuntime:Destroy() end)
         end
-        _G["__DeliriumRuntime"] = nil
+        local envG = (type(getgenv) == "function" and getgenv()) or _G or {}
+        if envG["__DeliriumRuntime"] == targetRuntime then
+            envG["__DeliriumRuntime"] = nil
+        end
     end
 
     if silent then
