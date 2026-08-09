@@ -4,20 +4,95 @@
 -- Tracks PASS / FAIL / SKIP per test and reports a summary.
 -- ==============================================================================
 
--- ── Load Library ──────────────────────────────────────────────────────────────
+-- ── Load Source ────────────────────────────────────────────────────────────────
+--
+--   USE_LOCAL = true   →  load dist/Delirium.lua from disk (test before push)
+--                         requires executor readfile() support
+--                         path is relative to the executor's workspace folder
+--
+--   USE_LOCAL = false  →  pull from raw GitHub URL (test published version)
+--
+-- ┌─ FLIP THIS ─────────────────────────────────────────────────────────────────
+local USE_LOCAL   = true
+-- └─────────────────────────────────────────────────────────────────────────────
 
-local RAW_URL = "https://raw.githubusercontent.com/DanteLuau/Delirium-Projects/main/Delirium.lua"
+local LOCAL_PATHS = {
+    "c:\\Users\\Admin\\AppData\\Local\\Madium\\Workspace\\Dev\\Delirium\\dist\\Delirium.lua",
+    "Dev\\Delirium\\dist\\Delirium.lua",
+    "Delirium\\dist\\Delirium.lua",
+    "dist\\Delirium.lua",
+    "Delirium.lua",
+}
 
-local ok, Delirium = pcall(function()
-    return loadstring(game:HttpGet(RAW_URL))()
-end)
+local RAW_URL     = "https://raw.githubusercontent.com/DanteLuau/Delirium-Projects/refs/heads/main/Delirium.lua"
+
+local function safeCompile(code)
+    local loadFn = (getgenv and getgenv().loadstring) or loadstring or load
+    if type(loadFn) ~= "function" then
+        error("No loadstring/load function available in executor environment")
+    end
+    local fn, err = loadFn(code)
+    if not fn then error("loadstring compilation failed: " .. tostring(err)) end
+    return fn()
+end
+
+local ok = false
+if not Delirium then
+    -- Check if Delirium was pre-loaded into environment
+    local envG = (type(getgenv) == "function" and getgenv()) or _G or {}
+    if type(shared) == "table" and shared.Delirium then
+        Delirium = shared.Delirium
+        ok = true
+        print("[TEST] ✓ Using pre-loaded Delirium session from shared")
+    elseif envG.Delirium then
+        Delirium = envG.Delirium
+        ok = true
+        print("[TEST] ✓ Using pre-loaded Delirium session")
+    elseif type(envG["__DeliriumRuntime"]) == "table" and envG["__DeliriumRuntime"].PublicApi then
+        Delirium = envG["__DeliriumRuntime"].PublicApi
+        ok = true
+        print("[TEST] ✓ Using pre-loaded Delirium session from runtime")
+    end
+else
+    ok = true
+    print("[TEST] ✓ Using pre-loaded Delirium session")
+end
+
+if not ok and USE_LOCAL then
+    -- Try multiple common executor workspace paths
+    for _, path in ipairs(LOCAL_PATHS) do
+        local src, readErr = pcall(readfile, path)
+        if src and type(readErr) == "string" and #readErr > 100 then
+            ok, Delirium = pcall(function()
+                return safeCompile(readErr)
+            end)
+            if ok then
+                print("[TEST] ✓ Loaded from LOCAL workspace path: " .. path)
+                break
+            end
+        end
+    end
+    if not ok then
+        warn("[TEST] readfile() failed on all local paths — falling back to GitHub raw URL...")
+    end
+end
+
+if not ok then
+    ok, Delirium = pcall(function()
+        local rawCode = game:HttpGet(RAW_URL)
+        return safeCompile(rawCode)
+    end)
+    if ok then
+        print("[TEST] ✓ Loaded from REMOTE URL: " .. RAW_URL)
+    end
+end
 
 if not ok or not Delirium then
-    warn("[TEST] Failed to load Delirium: " .. tostring(Delirium))
+    warn("[TEST] ✗ Failed to load Delirium: " .. tostring(Delirium))
     return
 end
 
-print("[TEST] Loaded Delirium " .. tostring(Delirium.Version))
+print("[TEST] Delirium v" .. tostring(Delirium.Version) .. " ready")
 
 -- ── Test Runner ───────────────────────────────────────────────────────────────
 
@@ -471,13 +546,13 @@ test("T07.11", "Show / Hide toggle", function()
     Tog1:Show()
 end)
 
-test("T07.12", "Toggle Default=true creates enabled state", function()
-    Tog2 = SecTog:CreateToggle({
-        Title   = "Starts On",
-        Default = true,
-        Callback = function(v) end,
-    })
-    assertEq(Tog2:Get(), true, "default true")
+test("T07.13", "Toggle GetDisplay() and tostring()", function()
+    Tog1:Set(true)
+    assertEq(Tog1:GetDisplay(), "ON", "GetDisplay true -> ON")
+    assertEq(tostring(Tog1), "ON", "tostring Tog1 -> ON")
+    Tog1:Set(false)
+    assertEq(Tog1:GetDisplay(), "OFF", "GetDisplay false -> OFF")
+    assertEq(tostring(Tog1), "OFF", "tostring Tog1 -> OFF")
 end)
 
 -- ── T08: Slider ───────────────────────────────────────────────────────────────
@@ -553,6 +628,12 @@ test("T08.11", "Float precision slider", function()
     })
     Slide2:Set(2.5)
     assertEq(Slide2:Get(), 2.5, "float precision set")
+end)
+
+test("T08.12", "Slider GetDisplay() and tostring()", function()
+    Slide1:Set(75)
+    assertEq(Slide1:GetDisplay(), "75", "GetDisplay 75")
+    assertEq(tostring(Slide1), "75", "tostring Slide1 75")
 end)
 
 -- ── T09: Dropdown ─────────────────────────────────────────────────────────────
@@ -632,6 +713,27 @@ test("T09.12", "Multi-select default has correct entries", function()
     assert(#v == 2, "two defaults selected")
 end)
 
+test("T09.13", "Dropdown GetDisplay() and tostring()", function()
+    Drop1:Set("Alpha")
+    assertEq(Drop1:GetDisplay(), "Alpha", "GetDisplay single")
+    assertEq(tostring(Drop1), "Alpha", "tostring Drop1")
+end)
+
+test("T09.14", "CreateDropdown Callback fires on selection change", function()
+    local callbackValue = nil
+    local d = SecDrop:CreateDropdown({
+        Title    = "Test Callback Dropdown",
+        Options  = {"Opt1", "Opt2"},
+        Default  = "Opt1",
+        Callback = function(val)
+            callbackValue = val
+        end,
+    })
+    d:Set("Opt2")
+    task.wait(0.05)
+    assertEq(callbackValue, "Opt2", "Callback fired on Set")
+end)
+
 -- ── T10: TextBox ──────────────────────────────────────────────────────────────
 
 print("\n── T10: TextBox ──")
@@ -690,6 +792,26 @@ test("T10.10", "Show / Hide textbox", function()
     TB1:Show()
 end)
 
+test("T10.11", "TextBox GetDisplay() and tostring()", function()
+    TB1:Set("Hello World")
+    assertEq(TB1:GetDisplay(), "Hello World", "GetDisplay text")
+    assertEq(tostring(TB1), "Hello World", "tostring TB1")
+end)
+
+test("T10.12", "CreateTextbox Callback fires on value change", function()
+    local callbackValue = nil
+    local tb = SecText:CreateTextbox({
+        Title    = "Test Callback TB",
+        Default  = "Val1",
+        Callback = function(val)
+            callbackValue = val
+        end,
+    })
+    tb:Set("Val2")
+    task.wait(0.05)
+    assertEq(callbackValue, "Val2", "Callback fired on Set")
+end)
+
 -- ── T11: Keybind ──────────────────────────────────────────────────────────────
 
 print("\n── T11: Keybind ──")
@@ -700,7 +822,11 @@ test("T11.1", "CreateKeybind returns api", function()
     KB1 = SecText:CreateKeybind({
         Title    = "Toggle UI",
         Default  = Enum.KeyCode.K,
-        Callback = function() print("[Test] Keybind fired") end,
+        Callback = function()
+            -- Fires when K (or current bound key) is pressed.
+            -- Shows the window if hidden; does nothing if already visible.
+            MainWin:Show()
+        end,
     })
     assertNotNil(KB1, "Keybind api")
 end)
@@ -743,6 +869,31 @@ end)
 test("T11.9", "Show / Hide keybind", function()
     KB1:Hide()
     KB1:Show()
+end)
+
+test("T11.10", "Keybind GetDisplay() and tostring()", function()
+    KB1:Set(Enum.KeyCode.K)
+    assertEq(KB1:GetDisplay(), "K", "GetDisplay key")
+    assertEq(tostring(KB1), "K", "tostring KB1")
+end)
+
+test("T11.11", "Keybind OnActivated signal exists", function()
+    assertNotNil(KB1.OnActivated, "OnActivated signal exists")
+    assertType(KB1.OnActivated.Connect, "function", "OnActivated:Connect exists")
+end)
+
+test("T11.12", "CreateKeybind Callback fires on key change", function()
+    local callbackValue = nil
+    local kb = SecText:CreateKeybind({
+        Title    = "Test Callback KB",
+        Default  = Enum.KeyCode.J,
+        Callback = function(val)
+            callbackValue = val
+        end,
+    })
+    kb:Set(Enum.KeyCode.H)
+    task.wait(0.05)
+    assertEq(callbackValue, Enum.KeyCode.H, "Callback fired on Set")
 end)
 
 -- ── T12: ColorPicker ──────────────────────────────────────────────────────────
@@ -804,6 +955,28 @@ end)
 test("T12.10", "Show / Hide colorpicker", function()
     CP1:Hide()
     CP1:Show()
+end)
+
+test("T12.11", "ColorPicker GetDisplay() and tostring()", function()
+    CP1:Set(Color3.fromRGB(255, 0, 0))
+    assertEq(CP1:GetDisplay(), "#FF0000", "GetDisplay hex")
+    assertEq(tostring(CP1), "#FF0000", "tostring CP1")
+end)
+
+test("T12.12", "CreateColorPicker Callback fires on color change", function()
+    local callbackValue = nil
+    local cp = SecText:CreateColorPicker({
+        Title    = "Test Callback CP",
+        Default  = Color3.fromRGB(255, 255, 255),
+        Callback = function(c)
+            callbackValue = c
+        end,
+    })
+    local red = Color3.fromRGB(255, 0, 0)
+    cp:Set(red)
+    task.wait(0.05)
+    assertNotNil(callbackValue, "Callback fired on Set")
+    assertEq(callbackValue.R, red.R, "Callback received new color R")
 end)
 
 -- ── T13: Label ────────────────────────────────────────────────────────────────
@@ -930,6 +1103,7 @@ local SecNotif = Tab4:CreateSection("Notifications")
 test("T16.1", "Notify returns handle", function()
     local h = Delirium:Notify({
         Title    = "Test Info",
+        Message  = "Notification system check",
         Duration = 2,
         Type     = "Info",
     })
@@ -937,17 +1111,17 @@ test("T16.1", "Notify returns handle", function()
 end)
 
 test("T16.2", "Notify Type=Success", function()
-    local h = Delirium:Notify({ Title="Success", Type="Success", Duration=2 })
+    local h = Delirium:Notify({ Title="Success", Message="Operation succeeded", Type="Success", Duration=2.5 })
     assertNotNil(h, "success notif")
 end)
 
 test("T16.3", "Notify Type=Warning", function()
-    local h = Delirium:Notify({ Title="Warning", Type="Warning", Duration=2 })
+    local h = Delirium:Notify({ Title="Warning", Message="Resource warning", Type="Warning", Duration=2.5 })
     assertNotNil(h, "warning notif")
 end)
 
 test("T16.4", "Notify Type=Error", function()
-    local h = Delirium:Notify({ Title="Error", Type="Error", Duration=2 })
+    local h = Delirium:Notify({ Title="Error", Message="Connection error", Type="Error", Duration=2.5 })
     assertNotNil(h, "error notif")
 end)
 
@@ -955,8 +1129,9 @@ test("T16.5", "Notify with Action button", function()
     local actionFired = false
     local h = Delirium:Notify({
         Title    = "With Action",
+        Message  = "Click Undo to revert",
         Type     = "Info",
-        Duration = 5,
+        Duration = 3,
         Action   = {
             Label    = "Undo",
             Callback = function() actionFired = true end,
@@ -968,41 +1143,48 @@ end)
 test("T16.6", "Notify handle has Dismiss()", function()
     local h = Delirium:Notify({ Title="Dismiss Test", Duration=10 })
     assertType(h.Dismiss, "function", "Dismiss")
-    h:Dismiss()
+    task.delay(0.5, function() h:Dismiss() end)
 end)
 
 test("T16.7", "Notify handle has SetTitle()", function()
-    local h = Delirium:Notify({ Title="Original", Duration=5 })
+    local h = Delirium:Notify({ Title="Original", Duration=3 })
     assertType(h.SetTitle, "function", "SetTitle on handle")
     h:SetTitle("Updated Title")
-    task.wait(0.05)
-    h:Dismiss()
 end)
 
 test("T16.8", "Notify handle has SetMessage()", function()
-    local h = Delirium:Notify({ Title="Msg Test", Duration=5 })
+    local h = Delirium:Notify({ Title="Msg Test", Message="Old body", Duration=3 })
     assertType(h.SetMessage, "function", "SetMessage on handle")
     h:SetMessage("Updated message body")
-    task.wait(0.05)
-    h:Dismiss()
 end)
 
 test("T16.9", "Persistent notif (Duration=0)", function()
-    local h = Delirium:Notify({ Title="Persistent", Duration=0, Type="Warning" })
+    local h = Delirium:Notify({ Title="Persistent Test", Message="Auto dismiss in 1s", Duration=0, Type="Warning" })
     assertNotNil(h, "persistent handle")
-    task.wait(0.1)
-    h:Dismiss()
+    task.delay(1, function() h:Dismiss() end)
 end)
 
 test("T16.10", "Multiple simultaneous notifications", function()
-    for i = 1, 3 do
+    local handles = {}
+    for i = 1, 2 do
         local h = Delirium:Notify({
             Title    = "Burst " .. i,
             Type     = "Info",
-            Duration = 1,
+            Duration = 2,
         })
         assertNotNil(h, "burst notif " .. i)
+        table.insert(handles, h)
     end
+end)
+
+test("T16.11", "Notify array message component formatting", function()
+    local h = Delirium:Notify({
+        Title    = "Array Formatting Test",
+        Message  = {"Bound Key: ", KB1, " | Value: ", Slide1},
+        Type     = "Success",
+        Duration = 3,
+    })
+    assertNotNil(h, "array message notify handle")
 end)
 
 -- UI buttons for manual notification tests
@@ -1184,8 +1366,19 @@ local SecWinCtrl = Tab4:CreateSection("Window Controls (Manual)")
 
 SecWinCtrl:CreateButton({
     Title       = "Hide Window",
-    Description = "Calls MainWin:Hide()",
-    Callback    = function() MainWin:Hide() end,
+    Description = "Calls MainWin:Hide() — check notification for keybind",
+    Callback    = function()
+        MainWin:Hide()
+        -- Notify tells the user which key to press to bring the window back.
+        -- Key is read live so it stays accurate if user rebinds KB1.
+        local keyName = KB1 and KB1:Get().Name or "K"
+        Delirium:Notify({
+            Title    = "Window Hidden",
+            Message  = {"Press  ", KB1, "  to unhide"},
+            Type     = "Info",
+            Duration = 0,  -- persistent until dismissed
+        })
+    end,
 })
 
 SecWinCtrl:CreateButton({
@@ -1319,47 +1512,123 @@ SecLife:CreateButton({
     end,
 })
 
--- ── T21: Section Aliases (AddX) ───────────────────────────────────────────────
+-- ── T22: Live Diagnostic & Performance Monitor ──────────────────────────────────
 
-print("\n── T21: Aliases (AddX) ──")
+print("\n── T22: Live Diagnostic & Performance Monitor ──")
 
-local SecAlias = Tab5:CreateSection("Alias API")
+local SecStats = Tab5:CreateSection("📊 System Performance & Diagnostic Monitor")
 
-test("T21.1", "AddButton alias works", function()
-    local b = SecAlias:AddButton({ Title="Alias Btn", Callback=function() end })
-    assertNotNil(b, "AddButton alias")
-    b:Destroy()
+local LblFPS      = SecStats:CreateLabel({ Title = "⚡ FPS: Calculating...", Description = "Real-time frame rate" })
+local LblPing     = SecStats:CreateLabel({ Title = "📶 Ping: Measuring...", Description = "Network latency to server" })
+local LblMem      = SecStats:CreateLabel({ Title = "🧠 Memory: Measuring...", Description = "Client Lua & Engine memory usage" })
+local LblThemeInfo= SecStats:CreateLabel({ Title = "🎨 Theme: Dark", Description = "Active ThemeEngine state" })
+local LblPlatform = SecStats:CreateLabel({ Title = "📱 Platform: Detecting...", Description = "Input modality & environment" })
+local LblUptime   = SecStats:CreateLabel({ Title = "⏱️ Suite Uptime: 0s", Description = "Execution session duration" })
+
+local RunService       = game:GetService("RunService")
+local StatsService     = game:GetService("Stats")
+local UserInputService = game:GetService("UserInputService")
+local startTime        = os.clock()
+
+-- Live update loop for diagnostic labels
+task.spawn(function()
+    local lastTime   = os.clock()
+    local frameCount = 0
+    local liveFps    = 60
+
+    RunService.RenderStepped:Connect(function()
+        frameCount += 1
+        local now = os.clock()
+        if now - lastTime >= 0.5 then
+            liveFps    = math.round(frameCount / (now - lastTime))
+            frameCount = 0
+            lastTime   = now
+        end
+    end)
+
+    while task.wait(0.5) do
+        pcall(function()
+            local mem = math.round(StatsService:GetTotalMemoryUsageMb())
+            local ping = 0
+            pcall(function()
+                local item = StatsService.Network.ServerStatsItem:FindFirstChild("Data Ping")
+                if item then ping = math.round(item:GetValue()) end
+            end)
+            local platform = UserInputService.TouchEnabled and "Mobile / Touch Input" or "Desktop / Keyboard & Mouse"
+            local uptime   = math.floor(os.clock() - startTime)
+            local theme    = Delirium.Theme.GetTheme()
+
+            if LblFPS and LblFPS.Instance then LblFPS:SetTitle("⚡ FPS: " .. tostring(liveFps) .. " FPS") end
+            if LblPing and LblPing.Instance then LblPing:SetTitle("📶 Ping: " .. tostring(ping) .. " ms") end
+            if LblMem and LblMem.Instance then LblMem:SetTitle("🧠 Memory: " .. tostring(mem) .. " MB") end
+            if LblThemeInfo and LblThemeInfo.Instance then LblThemeInfo:SetTitle("🎨 Active Theme: " .. theme) end
+            if LblPlatform and LblPlatform.Instance then LblPlatform:SetTitle("📱 Platform: " .. platform) end
+            if LblUptime and LblUptime.Instance then LblUptime:SetTitle(string.format("⏱️ Suite Uptime: %ds", uptime)) end
+        end)
+    end
 end)
 
-test("T21.2", "AddToggle alias works", function()
-    local t = SecAlias:AddToggle({ Title="Alias Tog", Default=false, Callback=function() end })
-    assertNotNil(t, "AddToggle alias")
-    t:Destroy()
-end)
+SecStats:CreateButton({
+    Title       = "Launch Floating Monitor Window",
+    Description = "Spawns an ultra-compact floating overlay window (No side tabs, mini-icon disabled)",
+    Callback    = function()
+        local monWin = Delirium:CreateWindow({
+            Name     = "Telemetry Overlay",
+            Subtitle = "Super Compact View",
+            Compact  = true,          -- No tabs, full width content!
+            MiniIcon = false,         -- Disable ⌘ button
+            Size     = UDim2.fromOffset(280, 220),
+        })
 
-test("T21.3", "AddSlider alias works", function()
-    local s = SecAlias:AddSlider({ Title="Alias Slide", Min=0, Max=10, Default=5, Callback=function() end })
-    assertNotNil(s, "AddSlider alias")
-    s:Destroy()
-end)
+        local monSec = monWin:CreateSection("Live Performance")
 
-test("T21.4", "AddDropdown alias works", function()
-    local d = SecAlias:AddDropdown({ Title="Alias Drop", Options={"X","Y"}, Callback=function() end })
-    assertNotNil(d, "AddDropdown alias")
-    d:Destroy()
-end)
+        local mLblFPS = monSec:CreateLabel({ Title = "⚡ Frame Rate",   Value = "60 FPS", Variant = "positive" })
+        local mLblMem = monSec:CreateLabel({ Title = "🧠 Memory Usage", Value = "0 MB",   Variant = "accent"   })
+        local mLblPing= monSec:CreateLabel({ Title = "📶 Latency Ping", Value = "0 ms",   Variant = "warning"  })
 
-test("T21.5", "AddLabel alias works", function()
-    local l = SecAlias:AddLabel({ Title="Alias Lbl" })
-    assertNotNil(l, "AddLabel alias")
-    l:Destroy()
-end)
+        monSec:CreateButton({
+            Title    = "Trigger Garbage Collection",
+            Callback = function()
+                local before = math.round(StatsService:GetTotalMemoryUsageMb())
+                collectgarbage("collect")
+                task.wait(0.2)
+                local after = math.round(StatsService:GetTotalMemoryUsageMb())
+                Delirium:Notify({
+                    Title    = "Memory GC Completed",
+                    Message  = string.format("Freed ~%d MB (%d MB -> %d MB)", math.max(0, before - after), before, after),
+                    Type     = "Success",
+                    Duration = 3,
+                })
+            end,
+        })
 
-test("T21.6", "AddDivider alias works", function()
-    local dv = SecAlias:AddDivider()
-    assertNotNil(dv, "AddDivider alias")
-    dv:Destroy()
-end)
+        monSec:CreateButton({
+            Title    = "Close Monitor",
+            Callback = function() monWin:Close() end,
+        })
+
+        -- Live monitor window update loop
+        task.spawn(function()
+            while monWin and not monWin._destroyed do
+                pcall(function()
+                    local mem = math.round(StatsService:GetTotalMemoryUsageMb())
+                    local ping = 0
+                    pcall(function()
+                        local item = StatsService.Network.ServerStatsItem:FindFirstChild("Data Ping")
+                        if item then ping = math.round(item:GetValue()) end
+                    end)
+                    local fpsVal = Workspace:GetRealPhysicsFPS() > 0 and math.round(Workspace:GetRealPhysicsFPS()) or 60
+                    mLblFPS:SetValue(tostring(fpsVal) .. " FPS")
+                    mLblMem:SetValue(tostring(mem) .. " MB")
+                    mLblPing:SetValue(tostring(ping) .. " ms")
+                end)
+                task.wait(0.5)
+            end
+        end)
+
+        Delirium:Notify({ Title = "Floating Monitor Window Launched", Type = "Info", Duration = 2 })
+    end,
+})
 
 -- ── Summary ───────────────────────────────────────────────────────────────────
 

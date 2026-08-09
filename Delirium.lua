@@ -233,6 +233,35 @@ function ComponentHelper.AddGradient(
     })
 end
 
+-- ─── Automatic Callback Pipeline ──────────────────────────────────────────────
+-- Automatically binds config.Callback to any signals present on a component API handle.
+-- Works for all existing components (Button, Toggle, Slider, Dropdown, ColorPicker, TextBox, Keybind)
+-- AND any future components automatically!
+function ComponentHelper.BindCallback(api: table, config: table?)
+    if not api or type(api) ~= "table" or not config or type(config) ~= "table" then
+        return api
+    end
+    if api._callbackBound then
+        return api  -- already bound, guard against duplicate connection
+    end
+
+    local callback = config.Callback
+    if type(callback) == "function" then
+        api._callbackBound = true
+        -- Inspect known event signal fields on the component handle
+        local signals = { api.OnChanged, api.OnSubmit, api.OnClicked, api.OnActivated }
+        for _, sig in ipairs(signals) do
+            if sig and type(sig.Connect) == "function" then
+                sig:Connect(function(...)
+                    task.spawn(callback, ...)
+                end)
+            end
+        end
+    end
+
+    return api
+end
+
 return ComponentHelper
 
 end
@@ -262,6 +291,15 @@ function Signal:Connect(fn: (...any) -> ())
             end
         end
     }
+end
+
+-- Alias so signal:OnChanged(fn) works as Connect(fn)
+function Signal:OnChanged(fn: (...any) -> ())
+    return self:Connect(fn)
+end
+
+Signal.__call = function(self, fn)
+    return self:Connect(fn)
 end
 
 function Signal:Fire(...)
@@ -463,8 +501,7 @@ end
 -- ─── Convenience helpers ──────────────────────────────────────────────────────
 
 -- Fade a GuiObject to fully opaque. Applies BackgroundTransparency always;
--- also fades TextTransparency on text instances and ImageTransparency on image instances.
--- `fromAlpha`: if provided, all applicable transparencies are snapped to this first.
+-- also fades GroupTransparency on CanvasGroups, TextTransparency on text instances, and ImageTransparency on image instances.
 function AnimationEngine.FadeIn(
     instance:  GuiObject,
     fromAlpha: number?,
@@ -473,6 +510,11 @@ function AnimationEngine.FadeIn(
     if not instance or not instance.Parent then return nil end
 
     local props = {}
+
+    if instance:IsA("CanvasGroup") then
+        if fromAlpha ~= nil then instance.GroupTransparency = fromAlpha end
+        props.GroupTransparency = 0
+    end
 
     -- Background — all GuiObjects
     if fromAlpha ~= nil then instance.BackgroundTransparency = fromAlpha end
@@ -499,6 +541,9 @@ function AnimationEngine.FadeOut(instance: GuiObject, info: TweenInfo?): Tween?
 
     local props = { BackgroundTransparency = 1 }
 
+    if instance:IsA("CanvasGroup") then
+        props.GroupTransparency = 1
+    end
     if instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox") then
         props.TextTransparency = 1
     end
@@ -507,6 +552,42 @@ function AnimationEngine.FadeOut(instance: GuiObject, info: TweenInfo?): Tween?
     end
 
     return AnimationEngine.Play(instance, info or Preset.Default, props, "fade")
+end
+
+-- CloseWindow: Smooth scale-down + slide-down + GroupTransparency fade-out for windows.
+function AnimationEngine.CloseWindow(
+    mainFrame: GuiObject,
+    onComplete: (() -> ())?,
+    info: TweenInfo?
+): Tween?
+    if not mainFrame or not mainFrame.Parent then
+        if onComplete then task.spawn(onComplete) end
+        return nil
+    end
+
+    local tweenInfo = info or Preset.Fast
+    local props     = { BackgroundTransparency = 1 }
+
+    if mainFrame:IsA("CanvasGroup") then
+        props.GroupTransparency = 1
+    end
+
+    local origPos = mainFrame.Position
+    props.Position = UDim2.new(
+        origPos.X.Scale, origPos.X.Offset,
+        origPos.Y.Scale, origPos.Y.Offset + 14
+    )
+
+    local tween = AnimationEngine.Play(mainFrame, tweenInfo, props, "window_close")
+    if tween then
+        tween.Completed:Connect(function()
+            if onComplete then task.spawn(onComplete) end
+        end)
+    else
+        if onComplete then task.spawn(onComplete) end
+    end
+
+    return tween
 end
 
 -- Slide a GuiObject in from a direction by offsetting its position.
@@ -1240,7 +1321,19 @@ end
 -- ── Window management ─────────────────────────────────────────────────────
 
 function Runtime:RegisterWindow(window)
+    window._runtime = self
     table.insert(self._windows, window)
+end
+
+-- Remove a single window from the registry (called by Window:Destroy).
+-- Prevents double-destroy when UnloadService cascades Runtime:Destroy().
+function Runtime:UnregisterWindow(window)
+    for i, w in ipairs(self._windows) do
+        if w == window then
+            table.remove(self._windows, i)
+            break
+        end
+    end
 end
 
 -- ── Resource management ───────────────────────────────────────────────────
@@ -1461,19 +1554,49 @@ local ThemeEngine = {
 -- Get a single color token for the current theme.
 -- On missing token: falls back to Dark theme, then emits a warning and returns a
 -- hot-pink sentinel (visible in dev) rather than crashing the entire frame.
+local function _isLightColor(c: Color3): boolean
+    local l = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+    return l > 0.5
+end
+
+-- Get a single color token for the current theme.
 function ThemeEngine.GetToken(tokenName: string): Color3
     local theme = THEMES[ThemeEngine._currentTheme]
     assert(theme, "ThemeEngine: unknown theme — " .. tostring(ThemeEngine._currentTheme))
     local token = theme[tokenName]
+    if token ~= nil then return token end
+
+    -- Intelligent dynamic token fallback
+    local surface = theme.Surface or THEMES.Dark.Surface
+    local isLight = _isLightColor(surface)
+
+    if tokenName == "SurfaceHover" then
+        return isLight
+            and Color3.new(math.max(0, surface.R - 0.05), math.max(0, surface.G - 0.05), math.max(0, surface.B - 0.05))
+            or  Color3.new(math.min(1, surface.R + 0.05), math.min(1, surface.G + 0.05), math.min(1, surface.B + 0.05))
+    elseif tokenName == "SurfaceActive" then
+        return isLight
+            and Color3.new(math.max(0, surface.R - 0.09), math.max(0, surface.G - 0.09), math.max(0, surface.B - 0.09))
+            or  Color3.new(math.min(1, surface.R + 0.09), math.min(1, surface.G + 0.09), math.min(1, surface.B + 0.09))
+    elseif tokenName == "CardBackground" then
+        return surface
+    elseif tokenName == "InputBackground" then
+        return isLight
+            and Color3.new(math.max(0, surface.R - 0.07), math.max(0, surface.G - 0.07), math.max(0, surface.B - 0.07))
+            or  Color3.new(math.max(0, surface.R - 0.04), math.max(0, surface.G - 0.04), math.max(0, surface.B - 0.04))
+    elseif tokenName == "ToggleOff" or tokenName == "SliderTrack" or tokenName == "ScrollBar" then
+        return theme.Border or THEMES.Dark.Border
+    elseif tokenName == "AccentText" then
+        local accent = theme.Accent or THEMES.Dark.Accent
+        return _isLightColor(accent) and Color3.fromRGB(20, 20, 30) or Color3.fromRGB(255, 255, 255)
+    elseif tokenName == "DisabledText" then
+        return theme.SubText or THEMES.Dark.SubText
+    end
+
+    token = THEMES.Dark[tokenName]
     if token == nil then
-        token = THEMES.Dark[tokenName]
-        if token == nil then
-            warn(string.format(
-                "ThemeEngine: token '%s' not found in '%s' or Dark fallback",
-                tostring(tokenName), ThemeEngine._currentTheme
-            ))
-            return Color3.fromRGB(255, 0, 200)  -- hot-pink sentinel — fix your token name
-        end
+        warn(string.format("ThemeEngine: token '%s' not found in '%s' or Dark fallback", tostring(tokenName), ThemeEngine._currentTheme))
+        return Color3.fromRGB(255, 0, 200)
     end
     return token
 end
@@ -1485,18 +1608,29 @@ end
 
 -- Get all tokens for the current theme (useful for bulk reads).
 function ThemeEngine.GetTokens(): table
-    return THEMES[ThemeEngine._currentTheme]
+    local proxy = setmetatable({}, {
+        __index = function(_, key)
+            return ThemeEngine.GetToken(key)
+        end
+    })
+    return proxy
 end
 
 -- Switch the active theme and notify all listeners.
--- Listener errors are caught and warned rather than crashing the theme switch.
 function ThemeEngine.SetTheme(themeName: string)
     assert(THEMES[themeName], "ThemeEngine: theme '" .. tostring(themeName) .. "' does not exist")
     ThemeEngine._currentTheme = themeName
-    local tokens = THEMES[themeName]
+
+    -- Wrap in proxy so any token access automatically resolves via ThemeEngine.GetToken
+    local tokensProxy = setmetatable({}, {
+        __index = function(_, key)
+            return ThemeEngine.GetToken(key)
+        end
+    })
+
     for id, listener in pairs(ThemeEngine._listeners) do
         task.spawn(function()
-            local ok, err = pcall(listener, tokens)
+            local ok, err = pcall(listener, tokensProxy)
             if not ok then
                 warn(string.format(
                     "ThemeEngine: listener [%d] errored during SetTheme('%s') — %s",
@@ -1508,7 +1642,6 @@ function ThemeEngine.SetTheme(themeName: string)
 end
 
 -- Register a listener for theme changes.
--- Returns a DISCONNECT FUNCTION — call it in component :Destroy() to prevent leaks.
 function ThemeEngine.OnThemeChanged(callback: (tokens: table) -> ()): () -> ()
     assert(type(callback) == "function", "ThemeEngine.OnThemeChanged expects a function")
     ThemeEngine._nextListenerId += 1
@@ -1521,16 +1654,12 @@ end
 
 -- ─── Extension API ────────────────────────────────────────────────────────────
 
--- Register a custom theme. Tokens not provided fall back to Dark values.
+-- Register a custom theme. Tokens not provided fall back dynamically via ThemeEngine.GetToken.
 function ThemeEngine.RegisterTheme(name: string, tokens: table)
     assert(type(name) == "string" and #name > 0, "RegisterTheme: name must be a non-empty string")
     assert(type(tokens) == "table", "RegisterTheme: tokens must be a table")
-    -- Fill any missing tokens from Dark as fallback
+
     local built = {}
-    for key, default in pairs(THEMES.Dark) do
-        built[key] = tokens[key] or default
-    end
-    -- Include any extra custom tokens
     for key, val in pairs(tokens) do
         built[key] = val
     end
@@ -1572,25 +1701,57 @@ _Delirium_modules["Layout.Section"] = function()
 -- Layout/Section.lua
 -- Owns its component handles. Cascade: Section:Destroy() → Component:Destroy()
 -- Idempotent: multiple :Destroy() calls are safe.
+--
+-- Collapse gesture model (M2 fix):
+--   Touch begin on header  → store InputObject ref, record start position, mark PENDING
+--   Touch move             → tracked via UserInputService.InputChanged (global, not HeaderLabel)
+--                            if delta > TAP_MOVE_THRESHOLD → mark DRAG, cancel toggle intent
+--   Touch end              → tracked via UserInputService.InputEnded (global)
+--                            if NOT drag → fire ToggleCollapsed (confirmed tap)
+--
+-- WHY global listeners instead of HeaderLabel.InputChanged / InputEnded:
+--   Roblox's ScrollingFrame (PageCanvas) consumes InputChanged events once it
+--   detects a scroll gesture. HeaderLabel stops seeing movement events, so
+--   _tapDragged never gets set to true. When the finger lifts, InputEnded fires
+--   ToggleCollapsed incorrectly. UserInputService signals cannot be suppressed
+--   by the ScrollingFrame. We filter to our specific touch using the InputObject
+--   reference — Roblox reuses the same InputObject instance across all Changed
+--   events for a given finger, so reference equality is a reliable filter.
+--
+-- First-collapse animation fix (M8):
+--   Problem: on first collapse, AutomaticSize=Y was still active so Frame.AbsoluteSize.Y
+--   was unreliable (0 or stale). Tween started from undefined geometry → visible jump.
+--   Fix: snapshot AbsoluteSize AFTER disabling AutomaticSize and explicitly locking Size
+--   to the current AbsoluteSize first. This guarantees the tween always starts from the
+--   correct measured height regardless of layout pass timing.
+
+local UserInputService = game:GetService("UserInputService")
 -- local Root            = script.Parent.Parent
 local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
 local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
 local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
 local Maid            = _Delirium_require("Core.Maid")
 
-local Button      = _Delirium_require("Components.Button")
-local Toggle      = _Delirium_require("Components.Toggle")
-local Slider      = _Delirium_require("Components.Slider")
-local TextBox     = _Delirium_require("Components.TextBox")
-local Dropdown    = _Delirium_require("Components.Dropdown")
-local Keybind     = _Delirium_require("Components.Keybind")
-local ColorPicker = _Delirium_require("Components.ColorPicker")
-local Label       = _Delirium_require("Components.Label")
-local Paragraph   = _Delirium_require("Components.Paragraph")
-local Divider     = _Delirium_require("Components.Divider")
+local Button        = _Delirium_require("Components.Button")
+local Toggle        = _Delirium_require("Components.Toggle")
+local Slider        = _Delirium_require("Components.Slider")
+local TextBox       = _Delirium_require("Components.TextBox")
+local Dropdown      = _Delirium_require("Components.Dropdown")
+local Keybind       = _Delirium_require("Components.Keybind")
+local ColorPicker   = _Delirium_require("Components.ColorPicker")
+local Label         = _Delirium_require("Components.Label")
+local Paragraph     = _Delirium_require("Components.Paragraph")
+local Divider       = _Delirium_require("Components.Divider")
+local UnloadService = _Delirium_require("Services.UnloadService")
 
 local Section = {}
 Section.__index = Section
+
+-- Tap vs scroll discrimination threshold (pixels).
+local TAP_MOVE_THRESHOLD = 12
+
+-- Collapsed height: header (16) + top pad (10) + bottom pad (10)
+local COLLAPSED_H = 36
 
 function Section.new(title: string, parentContent: Instance)
     local self = setmetatable({}, Section)
@@ -1599,17 +1760,13 @@ function Section.new(title: string, parentContent: Instance)
     self._componentCount = 1
     self._destroyed      = false
 
-    -- Owned children and resources
     self._handles = {}
     self._maid    = Maid.new()
 
     -- ─── Frame ─────────────────────────────────────────────────────────────
 
     self._collapsed = false
-    self._contentH  = 0   -- cached content height (px) used when expanding
-
-    -- Collapsed height: header (16px) + top padding (10) + bottom padding (10) = 36px
-    local COLLAPSED_H = 36
+    self._contentH  = 0
 
     self.Frame = ComponentHelper.Create("Frame", {
         Name                   = "Section_" .. self.Title,
@@ -1618,14 +1775,13 @@ function Section.new(title: string, parentContent: Instance)
         BackgroundColor3       = ThemeEngine.GetToken("Surface"),
         BackgroundTransparency = 0.5,
         BorderSizePixel        = 0,
-        ClipsDescendants       = true,   -- required: clips content when collapsed
+        ClipsDescendants       = true,
         Parent                 = parentContent,
     })
     ComponentHelper.AddCorner(self.Frame, 8)
     local stroke = ComponentHelper.AddStroke(self.Frame, ThemeEngine.GetToken("Border"), 1)
     ComponentHelper.AddPadding(self.Frame, 10, 10, 10, 10)
 
-    -- Store layout ref so SetCollapsed can read AbsoluteContentSize
     self._layout = ComponentHelper.Create("UIListLayout", {
         SortOrder = Enum.SortOrder.LayoutOrder,
         Padding   = UDim.new(0, 8),
@@ -1645,7 +1801,6 @@ function Section.new(title: string, parentContent: Instance)
         Parent                 = self.Frame,
     })
 
-    -- Chevron indicator — child of HeaderLabel so it doesn't enter the UIListLayout
     self._chevron = ComponentHelper.Create("TextLabel", {
         Name                   = "Chevron",
         Size                   = UDim2.new(0, 14, 1, 0),
@@ -1660,21 +1815,100 @@ function Section.new(title: string, parentContent: Instance)
         Parent                 = self.HeaderLabel,
     })
 
-    -- Collapse toggle — TextLabels fire InputBegan on both mouse and touch
-    self._maid:GiveTask(self.HeaderLabel.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
+    -- ─── Tap-vs-scroll discrimination (M2 fix) ─────────────────────────────
+    --
+    -- BUG-SEC fix: HeaderLabel is a TextLabel. On desktop, TextLabel.InputBegan
+    -- does NOT fire for MouseButton1 clicks — only TextButton receives those.
+    -- Fix: transparent TextButton (HeaderBtn) overlays the full header row.
+    --   Desktop: HeaderBtn.Activated  → ToggleCollapsed (clean, no gesture needed)
+    --   Mobile:  HeaderBtn.InputBegan → start tap-vs-scroll discrimination
+    --            UserInputService.InputChanged / InputEnded → confirm or cancel
+
+    local HeaderBtn = ComponentHelper.Create("TextButton", {
+        Name                   = "HeaderBtn",
+        Size                   = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text                   = "",
+        AutoButtonColor        = false,
+        ZIndex                 = self.HeaderLabel.ZIndex + 1,
+        Parent                 = self.HeaderLabel,
+    })
+
+    local _tapInput   = nil
+    local _tapStartX  = 0
+    local _tapStartY  = 0
+    local _tapPending = false
+    local _tapDragged = false
+
+    -- Desktop: MouseButton1Click only fires for actual mouse button presses,
+    -- never for touch events. Guard additionally with not TouchEnabled so
+    -- touchscreen PCs route through the InputEnded path instead.
+    self._maid:GiveTask(HeaderBtn.MouseButton1Click:Connect(function()
+        if UserInputService.TouchEnabled then return end  -- touch uses InputEnded path
+        self:ToggleCollapsed()
+    end))
+
+    -- Mobile: InputBegan starts tap-vs-scroll classification.
+    self._maid:GiveTask(HeaderBtn.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        _tapInput   = input
+        _tapStartX  = input.Position.X
+        _tapStartY  = input.Position.Y
+        _tapPending = true
+        _tapDragged = false
+    end))
+
+    self._maid:GiveTask(UserInputService.InputChanged:Connect(function(input)
+        if not _tapPending           then return end
+        if input ~= _tapInput        then return end
+        local dx = math.abs(input.Position.X - _tapStartX)
+        local dy = math.abs(input.Position.Y - _tapStartY)
+        if math.sqrt(dx * dx + dy * dy) > TAP_MOVE_THRESHOLD then
+            _tapDragged = true
+            _tapPending = false
+        end
+    end))
+
+    self._maid:GiveTask(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input ~= _tapInput then return end
+        if _tapPending and not _tapDragged then
             self:ToggleCollapsed()
         end
+        _tapPending = false
+        _tapDragged = false
+        _tapInput   = nil
     end))
 
     -- ─── Theme listener ─────────────────────────────────────────────────────
 
     self._maid:GiveTask(ThemeEngine.OnThemeChanged(function(tokens)
         TweenHelper.Tween(self.Frame,       nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(stroke,           nil, { Color = tokens.Border })
-        TweenHelper.Tween(self.HeaderLabel, nil, { TextColor3 = tokens.SubText })
-        TweenHelper.Tween(self._chevron,    nil, { TextColor3 = tokens.SubText })
+        TweenHelper.Tween(stroke,           nil, { Color = tokens.Border             })
+        TweenHelper.Tween(self.HeaderLabel, nil, { TextColor3 = tokens.SubText       })
+        TweenHelper.Tween(self._chevron,    nil, { TextColor3 = tokens.SubText       })
+    end))
+
+    -- M8 fix: snapshot settled height after first layout pass.
+    -- task.defer gives Roblox one frame to resolve AbsoluteSize after construction.
+    task.defer(function()
+        if self._destroyed then return end
+        local h = self.Frame.AbsoluteSize.Y
+        if h > COLLAPSED_H then
+            self._contentH = h
+        end
+    end)
+
+    -- Keep _contentH current whenever children are added or resized.
+    -- AbsoluteContentSize changes when a child's size changes (e.g. Paragraph
+    -- height recomputed via TextService). Without this, _contentH stays at the
+    -- constructor-time snapshot and SetCollapsed uses stale data.
+    self._maid:GiveTask(self._layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        if self._collapsed then return end  -- don't update while collapsed
+        local h = self.Frame.AbsoluteSize.Y
+        if h > COLLAPSED_H then
+            self._contentH = h
+        end
     end))
 
     return self
@@ -1692,9 +1926,46 @@ local function _applyOrder(frame: Instance, order: number)
     if frame then frame.LayoutOrder = order end
 end
 
--- Track and return a component handle.
-function Section:_register(handle)
+function Section:_register(handle, config)
+    ComponentHelper.BindCallback(handle, config)
     table.insert(self._handles, handle)
+
+    if handle and type(handle) ~= "table" then
+        return handle
+    end
+
+    -- Determine prevention from config flags
+    local preventUnload = false
+    if config and type(config) == "table" then
+        if config.KeepOnUnload == true
+            or config.IgnoreUnload == true
+            or config.AutoUnload == false
+        then
+            preventUnload = true
+        end
+    end
+
+    handle._keepOnUnload = preventUnload
+
+    -- Auto-register component cleanup with UnloadService (runs on Delirium:Unload)
+    UnloadService.Register(function()
+        if not handle._keepOnUnload and not handle._destroyed then
+            if type(handle.Destroy) == "function" then
+                pcall(handle.Destroy, handle)
+            end
+        end
+    end)
+
+    -- Runtime prevention API ─────────────────────────────────────────────────
+    function handle:SetKeepOnUnload(keep: boolean)
+        self._keepOnUnload = keep == true
+    end
+
+    -- Alias: SetIgnoreUnload(true) == SetKeepOnUnload(true)
+    function handle:SetIgnoreUnload(ignore: boolean)
+        self:SetKeepOnUnload(ignore)
+    end
+
     return handle
 end
 
@@ -1703,129 +1974,178 @@ end
 function Section:CreateButton(config: table)
     local h = Button.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddButton = Section.CreateButton
 
 function Section:CreateToggle(config: table)
     local h = Toggle.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddToggle = Section.CreateToggle
 
 function Section:CreateSlider(config: table)
     local h = Slider.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddSlider = Section.CreateSlider
 
 function Section:CreateTextbox(config: table)
     local h = TextBox.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddTextbox = Section.CreateTextbox
 
 function Section:CreateDropdown(config: table)
     local h = Dropdown.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddDropdown = Section.CreateDropdown
 
 function Section:CreateKeybind(config: table)
     local h = Keybind.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddKeybind = Section.CreateKeybind
 
 function Section:CreateColorPicker(config: table)
     local h = ColorPicker.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddColorPicker = Section.CreateColorPicker
 
 function Section:CreateLabel(config: table)
     local h = Label.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddLabel = Section.CreateLabel
 
 function Section:CreateParagraph(config: table)
     local h = Paragraph.New(self.Frame, config)
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddParagraph = Section.CreateParagraph
 
 function Section:CreateDivider(config: table)
     local h = Divider.New(self.Frame, config or {})
     _applyOrder(h.Instance, self:_nextOrder())
-    return self:_register(h)
+    return self:_register(h, config)
 end
 Section.AddDivider = Section.CreateDivider
 
--- ─── Collapse system ──────────────────────────────────────────────────────────
-
--- BUG-A fix: ToggleCollapsed / SetCollapsed were never implemented.
--- The header's InputBegan handler called self:ToggleCollapsed() which didn't
--- exist → crash on every tap. Implemented here.
+-- ─── Collapse system (M8 fix) ─────────────────────────────────────────────────
 --
--- Strategy:
---   Collapse: capture AbsoluteSize.Y → disable AutomaticSize → tween to COLLAPSED_H.
---   Expand:   tween back to captured height → re-enable AutomaticSize so future
---             content additions keep working.
---   Both:     rotate chevron and toggle ClipsDescendants timing so content doesn't
---             peek before the frame shrinks.
-
-local COLLAPSED_H = 36  -- header (16px) + top padding (10) + bottom padding (10)
+-- Root cause of first-collapse jump:
+--   Frame.AutomaticSize = Y was active while we called self.Frame.AbsoluteSize.Y.
+--   With AutomaticSize active, Roblox drives Size internally and the explicit
+--   Size property is ignored / stale. AbsoluteSize reflects the auto-computed
+--   value, but only AFTER the layout pass resolves — which may not have happened
+--   yet if this is the first interaction immediately after parenting.
+--
+--   The old flow was:
+--     1. Read AbsoluteSize.Y  ← potentially 0 or stale on first call
+--     2. Disable AutomaticSize
+--     3. Tween from current (wrong) Size to COLLAPSED_H  ← jump
+--
+--   Fixed flow (collapse):
+--     1. Disable AutomaticSize
+--     2. Explicitly lock Size.Y to current AbsoluteSize.Y (snapshot)
+--        This makes the explicit Size match reality before tween starts.
+--     3. Store snapshot as _contentH
+--     4. Tween from locked Size to COLLAPSED_H  ← smooth, always correct
+--
+--   Fixed flow (expand):
+--     1. Set Size.Y to COLLAPSED_H (current state — no jump)
+--     2. Tween to _contentH
+--     3. Re-enable AutomaticSize after tween settles
 
 function Section:SetCollapsed(collapsed: boolean, animate: boolean)
     if collapsed == self._collapsed then return end
     self._collapsed = collapsed
 
-    -- Chevron: ▾ at 0° when expanded, rotated -90° when collapsed.
-    local chevronRot = collapsed and -90 or 0
-    if animate then
-        TweenHelper.Tween(self._chevron, TweenHelper.FastInfo, { Rotation = chevronRot })
-    else
-        self._chevron.Rotation = chevronRot
-    end
-
     if collapsed then
-        -- Snapshot full height before disabling AutomaticSize.
-        -- AbsoluteSize.Y reflects the current rendered height reliably here
-        -- because we only collapse after the frame has already been laid out.
-        self._contentH = self.Frame.AbsoluteSize.Y
+        -- ── COLLAPSE ──────────────────────────────────────────────────────
+        --
+        -- ROOT-CAUSE FIX: read AbsoluteSize.Y BEFORE setting AutomaticSize = None.
+        -- When AutomaticSize switches to None, Roblox immediately uses the explicit
+        -- Size property. The explicit Size is UDim2.new(1,0,0,0) (set at construction).
+        -- So AbsoluteSize.Y drops to 0 the instant AutomaticSize = None is assigned.
+        -- Reading AFTER = always 0 → guard fires → retry loop →
+        -- AutomaticSize toggles → pageLayout.AbsoluteContentSizeChanged fires →
+        -- re-entrancy at depth 80.
+        --
+        -- Reading BEFORE = actual computed height with all children = correct.
+        local fullH = self.Frame.AbsoluteSize.Y
 
-        -- Stop AutomaticSize so we can manually drive the Size.
+        -- Secondary: fall back to cached _contentH if live read is stale (e.g.
+        -- collapse called mid-expand-tween where AbsoluteSize is still intermediate).
+        if fullH <= COLLAPSED_H and self._contentH > COLLAPSED_H then
+            fullH = self._contentH
+        end
+
+        if fullH <= COLLAPSED_H then
+            -- Layout is already at or below collapsed height; lock frame size safely without recursion
+            if animate then
+                TweenHelper.Tween(self._chevron, TweenHelper.FastInfo, { Rotation = -90 })
+            else
+                self._chevron.Rotation = -90
+            end
+            self.Frame.AutomaticSize = Enum.AutomaticSize.None
+            self.Frame.Size = UDim2.new(1, 0, 0, COLLAPSED_H)
+            return
+        end
+        self._contentH = fullH
+
+        -- Chevron — rotate after geometry is confirmed.
+        if animate then
+            TweenHelper.Tween(self._chevron, TweenHelper.FastInfo, { Rotation = -90 })
+        else
+            self._chevron.Rotation = -90
+        end
+
+        -- Disable AutomaticSize AFTER snapshotting fullH, then lock Size.
         self.Frame.AutomaticSize = Enum.AutomaticSize.None
-        self.Frame.ClipsDescendants = true  -- already true, but be explicit
+        self.Frame.Size = UDim2.new(1, 0, 0, fullH)
 
+        -- Tween from locked full height → collapsed height.
         if animate then
             TweenHelper.Tween(self.Frame, TweenHelper.FastInfo,
                 { Size = UDim2.new(1, 0, 0, COLLAPSED_H) }, "collapse")
         else
             self.Frame.Size = UDim2.new(1, 0, 0, COLLAPSED_H)
         end
+
     else
-        -- Expand: use cached full height. Fall back to a sensible estimate if
-        -- _contentH was never captured (e.g. collapsed before first layout).
-        local targetH = self._contentH > 0 and self._contentH
-            or (COLLAPSED_H + self._layout.AbsoluteContentSize.Y + 8)
+        -- ── EXPAND ────────────────────────────────────────────────────────
+        -- Chevron first — expand never has a layout-race condition since the
+        -- section was already collapsed at a known geometry.
+        if animate then
+            TweenHelper.Tween(self._chevron, TweenHelper.FastInfo, { Rotation = 0 })
+        else
+            self._chevron.Rotation = 0
+        end
+
+        local targetH = self._contentH > COLLAPSED_H and self._contentH
+            or (COLLAPSED_H + self._layout.AbsoluteContentSize.Y + 20)
+
+        -- Ensure explicit Size matches current collapsed state before tweening.
+        -- Defensive: handles the case where expand is called without a prior collapse.
+        self.Frame.AutomaticSize = Enum.AutomaticSize.None
+        self.Frame.Size          = UDim2.new(1, 0, 0, COLLAPSED_H)
 
         if animate then
-            -- Use the same "collapse" key so a rapid retoggle cancels the
-            -- in-flight tween in both directions instead of stacking.
             TweenHelper.Tween(self.Frame, TweenHelper.FastInfo,
                 { Size = UDim2.new(1, 0, 0, targetH) }, "collapse")
-            -- Re-enable AutomaticSize after the tween settles so future
-            -- component additions continue auto-resizing the section.
+            -- Re-enable AutomaticSize after tween settles so future component
+            -- additions continue to auto-resize the section correctly.
             task.delay(TweenHelper.FastInfo.Time + 0.02, function()
                 if not self._collapsed and self.Frame and self.Frame.Parent then
                     self.Frame.AutomaticSize = Enum.AutomaticSize.Y
@@ -1849,13 +2169,8 @@ function Section:SetTitle(title: string)
     self.HeaderLabel.Text = string.upper(title)
 end
 
-function Section:Show()
-    self.Frame.Visible = true
-end
-
-function Section:Hide()
-    self.Frame.Visible = false
-end
+function Section:Show()  self.Frame.Visible = true  end
+function Section:Hide()  self.Frame.Visible = false end
 
 -- ─── Destroy (idempotent) ──────────────────────────────────────────────────
 
@@ -1863,17 +2178,13 @@ function Section:Destroy()
     if self._destroyed then return end
     self._destroyed = true
 
-    -- Cascade: destroy all owned component handles
-    -- Each handle cleans its own themeDisconnect, connections, signals, instances.
     for _, handle in ipairs(self._handles) do
         pcall(function() handle:Destroy() end)
     end
     table.clear(self._handles)
 
-    -- Clean own resources: theme listener
     self._maid:DoCleaning()
 
-    -- Destroy root GUI instance
     if self.Frame and self.Frame.Parent then
         self.Frame:Destroy()
     end
@@ -2014,11 +2325,18 @@ function Tab.new(config: table, windowManager: table)
     self._maid:GiveTask(ThemeEngine.OnThemeChanged(function(tokens)
         self.PageCanvas.ScrollBarImageColor3 = tokens.Border
         if self.IsActive then
-            self.NavLabel.TextColor3        = tokens.Accent
-            self.Indicator.BackgroundColor3 = tokens.Accent
-            self.NavButton.BackgroundColor3 = tokens.Surface
+            -- Active: accent label, accent indicator visible, surface background
+            self.NavLabel.TextColor3              = tokens.Accent
+            self.Indicator.BackgroundColor3       = tokens.Accent
+            self.Indicator.BackgroundTransparency = 0
+            self.NavButton.BackgroundColor3       = tokens.Surface
+            self.NavButton.BackgroundTransparency = 0.2
         else
-            self.NavLabel.TextColor3 = tokens.SubText
+            -- Inactive: subdued label, indicator hidden, bg transparent
+            self.NavLabel.TextColor3              = tokens.SubText
+            self.Indicator.BackgroundColor3       = tokens.Accent  -- pre-load color so next activation tweens correctly
+            self.Indicator.BackgroundTransparency = 1
+            self.NavButton.BackgroundTransparency = 1
         end
     end))
 
@@ -2148,6 +2466,7 @@ local TweenHelper       = _Delirium_require("Utilities.TweenHelper")
 local ComponentHelper   = _Delirium_require("Utilities.ComponentHelper")
 local Maid              = _Delirium_require("Core.Maid")
 local DialogService     = _Delirium_require("Services.DialogService")
+local UnloadService     = _Delirium_require("Services.UnloadService")
 local Tab               = _Delirium_require("Layout.Tab")
 
 local TITLEBAR_H     = 45
@@ -2184,9 +2503,18 @@ function Window.new(config: table, parentGui: ScreenGui)
     local function _responsiveDefaultSize(): UDim2
         local cam = workspace.CurrentCamera
         local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-        local w   = math.clamp(math.floor(vp.X * 0.94), 320, 580)
-        local h   = math.clamp(math.floor(vp.Y * 0.70), 320, 380)
-        return UDim2.fromOffset(w, h)
+        if vp.X < 600 then
+            -- M3 fix: phone-sized viewport — visible margins so the window
+            -- doesn't feel fullscreen. 82% width leaves ~35px margin each side.
+            local w = math.clamp(math.floor(vp.X * 0.82), 300, 400)
+            local h = math.clamp(math.floor(vp.Y * 0.60), 280, 360)
+            return UDim2.fromOffset(w, h)
+        else
+            -- Desktop / tablet landscape: original sizing
+            local w = math.clamp(math.floor(vp.X * 0.94), 320, 580)
+            local h = math.clamp(math.floor(vp.Y * 0.70), 320, 380)
+            return UDim2.fromOffset(w, h)
+        end
     end
 
     -- Store original size for Restore().
@@ -2194,15 +2522,16 @@ function Window.new(config: table, parentGui: ScreenGui)
 
     -- ─── Main frame ──────────────────────────────────────────────────────
 
-    self.MainFrame = ComponentHelper.Create("Frame", {
-        Name             = "DeliriumMainFrame",
-        Size             = self._originalSize,
-        Position         = UDim2.fromScale(0.5, 0.5),
-        AnchorPoint      = Vector2.new(0.5, 0.5),
-        BackgroundColor3 = ThemeEngine.GetToken("Background"),
-        BorderSizePixel  = 0,
-        ClipsDescendants = true,
-        Parent           = parentGui,
+    self.MainFrame = ComponentHelper.Create("CanvasGroup", {
+        Name              = "DeliriumMainFrame",
+        Size              = self._originalSize,
+        Position          = UDim2.fromScale(0.5, 0.5),
+        AnchorPoint       = Vector2.new(0.5, 0.5),
+        BackgroundColor3  = ThemeEngine.GetToken("Background"),
+        BorderSizePixel   = 0,
+        GroupTransparency = 0,
+        ClipsDescendants  = true,
+        Parent            = parentGui,
     })
     ComponentHelper.AddCorner(self.MainFrame, 10)
     local mainStroke = ComponentHelper.AddStroke(self.MainFrame, ThemeEngine.GetToken("Border"), 1)
@@ -2320,6 +2649,11 @@ function Window.new(config: table, parentGui: ScreenGui)
         self:Close()
     end))
 
+    -- Configurable titlebar button visibility (default true)
+    if config.MiniIcon == false then self._miniIconBtn.Visible = false end
+    if config.Minimize == false then self._minimizeBtn.Visible = false end
+    if config.Close    == false then self._closeBtn.Visible    = false end
+
     -- ─── Content container ───────────────────────────────────────────────
 
     self.ContentContainer = ComponentHelper.Create("Frame", {
@@ -2331,12 +2665,21 @@ function Window.new(config: table, parentGui: ScreenGui)
         Parent                 = self.MainFrame,
     })
 
+    -- Layout mode: Full (with SideNav tabs) vs Compact / NoTabs (full-width page canvas)
+    local isCompact = config.Compact == true or config.Tabs == false or config.NoTabs == true
+    self._isCompact = isCompact
+
+    local _navCam   = workspace.CurrentCamera
+    local _navVp    = _navCam and _navCam.ViewportSize or Vector2.new(1920, 1080)
+    local SIDENAV_W = isCompact and 0 or (_navVp.X < 600 and 110 or 140)
+
     self.SideNav = ComponentHelper.Create("ScrollingFrame", {
         Name                   = "SideNav",
-        Size                   = UDim2.new(0, 140, 1, 0),
+        Size                   = UDim2.new(0, SIDENAV_W, 1, 0),
         BackgroundTransparency = 1,
         BorderSizePixel        = 0,
-        ScrollBarThickness     = 0,
+        ScrollBarThickness     = _navVp.X < 600 and 2 or 0,
+        Visible                = not isCompact,
         Parent                 = self.ContentContainer,
     })
     ComponentHelper.AddPadding(self.SideNav, 8, 8, 8, 8)
@@ -2345,9 +2688,7 @@ function Window.new(config: table, parentGui: ScreenGui)
         Padding   = UDim.new(0, 4),
         Parent    = self.SideNav,
     })
-    -- Auto-resize SideNav canvas so all tabs remain reachable via scroll.
-    -- Without this the ScrollingFrame defaults to CanvasSize=(0,0) and
-    -- tabs that overflow the visible height are unreachable on mobile.
+
     self._maid:GiveTask(
         sideNavLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
             self.SideNav.CanvasSize =
@@ -2355,19 +2696,20 @@ function Window.new(config: table, parentGui: ScreenGui)
         end)
     )
 
-    ComponentHelper.Create("Frame", {
+    local divider = ComponentHelper.Create("Frame", {
         Name             = "NavDivider",
         Size             = UDim2.new(0, 1, 1, -16),
-        Position         = UDim2.new(0, 140, 0, 8),
+        Position         = UDim2.new(0, SIDENAV_W, 0, 8),
         BackgroundColor3 = ThemeEngine.GetToken("Border"),
         BorderSizePixel  = 0,
+        Visible          = not isCompact,
         Parent           = self.ContentContainer,
     })
 
     self.PageView = ComponentHelper.Create("Frame", {
         Name                   = "PageView",
-        Size                   = UDim2.new(1, -141, 1, 0),
-        Position               = UDim2.new(0, 141, 0, 0),
+        Size                   = isCompact and UDim2.new(1, 0, 1, 0) or UDim2.new(1, -(SIDENAV_W + 1), 1, 0),
+        Position               = isCompact and UDim2.new(0, 0, 0, 0) or UDim2.new(0, SIDENAV_W + 1, 0, 0),
         BackgroundTransparency = 1,
         Parent                 = self.ContentContainer,
     })
@@ -2677,6 +3019,29 @@ function Window:CreateTab(config: table)
     return tab
 end
 
+-- Direct section creation helper (no explicit tab required).
+-- Ideal for compact floating windows, overlays, or simple single-page panels.
+function Window:CreateSection(title: string)
+    if not self._defaultTab then
+        self._defaultTab = self:CreateTab({ Name = "Main" })
+        if self._isCompact and self._defaultTab.NavButton then
+            self._defaultTab.NavButton.Visible = false
+        end
+    end
+    return self._defaultTab:CreateSection(title)
+end
+Window.AddSection = Window.CreateSection
+
+-- Register a callback to execute when this session is fully unloaded.
+-- Delegates to UnloadService so it fires even if the window is closed first.
+function Window:OnUnload(fn: () -> ())
+    if type(fn) == "function" then
+        UnloadService.Register(fn)
+    end
+end
+-- Alias
+Window.OnClose = Window.OnUnload
+
 -- SelectTab: the single authoritative source of tab activation.
 -- Uses Tab:_ApplyActive() (private visual-only method) so there is no
 -- circular call back into SelectTab. Skips destroyed tab entries.
@@ -2782,6 +3147,7 @@ function Window:RestoreFromMiniIcon()
     end)
 
     -- Restore window with matching pop
+    self.MainFrame.GroupTransparency      = 1
     self.MainFrame.BackgroundTransparency = 1
     self.MainFrame.Size                   = self._originalSize
     self.MainFrame.Visible                = true
@@ -2821,11 +3187,20 @@ function Window:_ExecuteClose()
     if self._config.OnClose then
         task.spawn(self._config.OnClose)
     end
+    if self._config.OnUnload then
+        task.spawn(self._config.OnUnload)
+    end
 
-    AnimationEngine.FadeOut(self.MainFrame, TweenHelper.FastInfo)
-    task.delay(TweenHelper.FastInfo.Time + 0.02, function()
+    -- Check if window close should trigger a full script unload
+    local isMain = (self._runtime and #self._runtime._windows <= 1)
+    if self._config.UnloadOnClose == true or (self._config.UnloadOnClose ~= false and isMain) then
+        UnloadService.Unload({ Duration = 2.5 })
+        return
+    end
+
+    AnimationEngine.CloseWindow(self.MainFrame, function()
         self:Destroy()
-    end)
+    end, TweenHelper.FastInfo)
 end
 
 function Window:Show()
@@ -2853,6 +3228,11 @@ end
 function Window:Destroy()
     if self._destroyed then return end
     self._destroyed = true
+
+    -- Remove from runtime tracking first to prevent double-destroy during unload cascade
+    if self._runtime and type(self._runtime.UnregisterWindow) == "function" then
+        pcall(function() self._runtime:UnregisterWindow(self) end)
+    end
 
     for _, tab in ipairs(self._tabs) do
         pcall(function() tab:Destroy() end)
@@ -3083,16 +3463,12 @@ function Button.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(frame, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(stroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        icon.ImageColor3 = tokens.SubText
-        if descLabel then
-            TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
-        end
-        if not loading then
-            loadFill.BackgroundColor3 = tokens.AccentDim
-        end
+        frame.BackgroundColor3  = tokens.Surface
+        stroke.Color            = tokens.Border
+        titleLabel.TextColor3   = tokens.Text
+        icon.ImageColor3        = tokens.SubText
+        if descLabel then descLabel.TextColor3 = tokens.SubText end
+        if not loading then loadFill.BackgroundColor3 = tokens.AccentDim end
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
@@ -3178,6 +3554,18 @@ _Delirium_modules["Components.ColorPicker"] = function()
 -- Components/ColorPicker.lua
 -- Inline expandable HSV color picker.
 -- Hue strip + SV gradient square + hex preview.
+--
+-- Gesture ownership model (M7 fix):
+--   Touch begin on SV/Hue  → PENDING (no color change)
+--   First movement         → classify intent against threshold
+--   Intent confirmed       → component LOCKS ownership for entire gesture
+--   Lock held until InputEnded regardless of how long gesture continues
+--   Page scroll cannot steal gesture after ownership is locked
+--
+-- Previous bug: svPending/huePending would re-evaluate on EVERY InputChanged
+-- frame, so a long hold followed by any movement could re-classify an
+-- already-yielded gesture back to color-drag. Fixed by setting a hard
+-- LOCKED state that is never re-evaluated mid-gesture.
 
 local UserInputService = game:GetService("UserInputService")
 -- local Root             = script.Parent.Parent
@@ -3188,12 +3576,10 @@ local Signal           = _Delirium_require("Utilities.Signal")
 
 local ColorPicker = {}
 
--- Convert Color3 → H,S,V (0–1 each)
 local function toHSV(c: Color3): (number, number, number)
     return Color3.toHSV(c)
 end
 
--- Build a hex string from Color3
 local function toHex(c: Color3): string
     return string.format("#%02X%02X%02X",
         math.round(c.R * 255),
@@ -3201,38 +3587,31 @@ local function toHex(c: Color3): string
         math.round(c.B * 255))
 end
 
--- ─── Gradient builder helpers ─────────────────────────────────────────────────
-
--- Fills a UIGradient with a horizontal hue spectrum
 local function applyHueGradient(uiGrad: UIGradient)
     local seq = {}
     for i = 0, 6 do
-        table.insert(seq, ColorSequenceKeypoint.new(i / 6,
-            Color3.fromHSV(i / 6, 1, 1)))
+        table.insert(seq, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6, 1, 1)))
     end
     uiGrad.Color = ColorSequence.new(seq)
 end
 
--- Fills a UIGradient for SV square at a given hue
-local function applySVGradient(satGrad: UIGradient, valGrad: UIGradient, hue: number)
-    -- Horizontal: white → full hue color
-    satGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(1,1,1)),
-        ColorSequenceKeypoint.new(1, Color3.fromHSV(hue, 1, 1)),
-    })
-    -- Vertical overlay: transparent → black (applied via separate frame on top)
-    valGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.new(0,0,0)),
-        ColorSequenceKeypoint.new(1, Color3.new(0,0,0)),
-    })
-    valGrad.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 1),
-        NumberSequenceKeypoint.new(1, 0),
-    })
-    valGrad.Rotation = 90
-end
+-- ─── Gesture ownership enum ───────────────────────────────────────────────────
+-- IDLE    → no finger down
+-- PENDING → finger down, not yet classified
+-- SV      → slider owns, SV square gesture locked
+-- HUE     → slider owns, hue strip gesture locked
+-- YIELDED → yielded to page scroll for this gesture cycle
 
--- ─── Main constructor ─────────────────────────────────────────────────────────
+local GestureState = {
+    IDLE    = "IDLE",
+    PENDING = "PENDING",
+    SV      = "SV",
+    HUE     = "HUE",
+    YIELDED = "YIELDED",
+}
+
+local GESTURE_THRESHOLD  = 10   -- px before intent is classified
+local HUE_DOMINANCE      = 1.5  -- dy must exceed dx by this factor for hue strip vertical drag
 
 function ColorPicker.New(parent: Instance, config: table)
     config = config or {}
@@ -3292,7 +3671,6 @@ function ColorPicker.New(parent: Instance, config: table)
         })
     end
 
-    -- Color swatch (right side, acts as toggle)
     local Swatch = ComponentHelper.Create("TextButton", {
         Position           = UDim2.new(1, -44, 0.5, -12),
         Size               = UDim2.new(0, 32, 0, 24),
@@ -3306,9 +3684,8 @@ function ColorPicker.New(parent: Instance, config: table)
 
     -- ─── Expanded picker area ──────────────────────────────────────────────
 
-    local PICKER_H = 168  -- total height of picker content below the row
+    local PICKER_H = 168
 
-    -- SV square
     local SVSquare = ComponentHelper.Create("Frame", {
         Position           = UDim2.new(0, 12, 0, 52),
         Size               = UDim2.new(1, -76, 0, 120),
@@ -3318,16 +3695,14 @@ function ColorPicker.New(parent: Instance, config: table)
     })
     ComponentHelper.AddCorner(SVSquare, 6)
 
-    -- Saturation gradient (horizontal)
     local satGrad = ComponentHelper.Create("UIGradient", {
         Color  = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(1,1,1)),
+            ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
             ColorSequenceKeypoint.new(1, Color3.fromHSV(h, 1, 1)),
         }),
         Parent = SVSquare,
     })
 
-    -- Value (darkness) overlay
     local valOverlay = ComponentHelper.Create("Frame", {
         Size               = UDim2.fromScale(1, 1),
         BackgroundColor3   = Color3.new(0, 0, 0),
@@ -3336,10 +3711,10 @@ function ColorPicker.New(parent: Instance, config: table)
         Parent             = SVSquare,
     })
     ComponentHelper.AddCorner(valOverlay, 6)
-    local valGrad = ComponentHelper.Create("UIGradient", {
+    ComponentHelper.Create("UIGradient", {
         Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(0,0,0)),
-            ColorSequenceKeypoint.new(1, Color3.new(0,0,0)),
+            ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
+            ColorSequenceKeypoint.new(1, Color3.new(0, 0, 0)),
         }),
         Transparency = NumberSequence.new({
             NumberSequenceKeypoint.new(0, 1),
@@ -3349,7 +3724,6 @@ function ColorPicker.New(parent: Instance, config: table)
         Parent   = valOverlay,
     })
 
-    -- SV cursor dot (20px so touch can actually grab it)
     local SVCursor = ComponentHelper.Create("Frame", {
         Size               = UDim2.new(0, 20, 0, 20),
         AnchorPoint        = Vector2.new(0.5, 0.5),
@@ -3360,13 +3734,12 @@ function ColorPicker.New(parent: Instance, config: table)
         Parent             = SVSquare,
     })
     ComponentHelper.AddCorner(SVCursor, 10)
-    ComponentHelper.AddStroke(SVCursor, Color3.new(0,0,0), 1.5)
+    ComponentHelper.AddStroke(SVCursor, Color3.new(0, 0, 0), 1.5)
 
-    -- Hue strip (right of SV square)
     local HueStrip = ComponentHelper.Create("Frame", {
         Position           = UDim2.new(1, -56, 0, 52),
         Size               = UDim2.new(0, 16, 0, 120),
-        BackgroundColor3   = Color3.new(1,1,1),
+        BackgroundColor3   = Color3.new(1, 1, 1),
         BorderSizePixel    = 0,
         Parent             = Row,
     })
@@ -3374,7 +3747,6 @@ function ColorPicker.New(parent: Instance, config: table)
     local hueGrad = ComponentHelper.Create("UIGradient", { Rotation = 90, Parent = HueStrip })
     applyHueGradient(hueGrad)
 
-    -- Hue cursor line (8px tall — taller touch target on the narrow strip)
     local HueCursor = ComponentHelper.Create("Frame", {
         Size               = UDim2.new(1, 4, 0, 8),
         AnchorPoint        = Vector2.new(0.5, 0.5),
@@ -3385,9 +3757,8 @@ function ColorPicker.New(parent: Instance, config: table)
         Parent             = HueStrip,
     })
     ComponentHelper.AddCorner(HueCursor, 4)
-    ComponentHelper.AddStroke(HueCursor, Color3.new(0,0,0), 1.5)
+    ComponentHelper.AddStroke(HueCursor, Color3.new(0, 0, 0), 1.5)
 
-    -- Hex display label
     local HexLabel = ComponentHelper.Create("TextLabel", {
         Position           = UDim2.new(0, 12, 0, 180),
         Size               = UDim2.new(1, -24, 0, 18),
@@ -3400,130 +3771,189 @@ function ColorPicker.New(parent: Instance, config: table)
         Parent             = Row,
     })
 
-    -- ─── Internal update ───────────────────────────────────────────────────
+    -- ─── Internal color update ─────────────────────────────────────────────
 
-    local function rebuildColor()
+    local lastFireTime  = 0
+    local FIRE_THROTTLE = 0.04  -- max 25 Hz signal fire rate during rapid drag
+
+    local function rebuildColor(forceFire: boolean?)
         currentColor = Color3.fromHSV(h, s, v)
         Swatch.BackgroundColor3 = currentColor
         HexLabel.Text = toHex(currentColor)
-        -- Update SV square background and gradient
         SVSquare.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
         satGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(1,1,1)),
+            ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
             ColorSequenceKeypoint.new(1, Color3.fromHSV(h, 1, 1)),
         })
-        -- Move cursors
         SVCursor.Position  = UDim2.new(s, 0, 1 - v, 0)
         HueCursor.Position = UDim2.new(0.5, 0, h, 0)
-        OnChanged:Fire(currentColor)
+
+        local now = os.clock()
+        if forceFire or (now - lastFireTime >= FIRE_THROTTLE) then
+            lastFireTime = now
+            OnChanged:Fire(currentColor)
+        end
     end
 
-    -- ─── SV square drag ────────────────────────────────────────────────────
-    -- Touch threshold: only start SV drag after clear 2D movement, preventing
-    -- accidental color changes when scrolling past a ColorPicker.
+    -- ─── Unified gesture state machine (M7 fix) ────────────────────────────
+    --
+    -- Single gestureState variable governs the entire session.
+    -- Once LOCKED (SV or HUE), state is never re-classified until InputEnded.
+    --
+    -- Scroll suppression (M7 completion):
+    --   Root cause of gesture loss after a long hold: Roblox's PageCanvas
+    --   ScrollingFrame runs its own internal scroll tracker in parallel with
+    --   child GuiObject input handlers. After enough time or movement it claims
+    --   the gesture independently, causing the page to scroll even though
+    --   ColorPicker's LOCKED state is correctly preventing color changes.
+    --   Fix: when ownership transitions from PENDING to SV or HUE, set
+    --   ScrollingEnabled = false on the ancestor PageCanvas. Restore on reset.
+    --   YIELDED gestures do NOT lock — the page scroll should own those.
 
-    -- BUG-06 fix: use pending flags so touch drags are only committed after
-    -- direction intent is confirmed. Previously draggingSV=true was set immediately
-    -- on InputBegan, which intercepted every passing scroll gesture on SVSquare.
-    -- Now the global InputChanged handler only updates color once committed.
-    local draggingSV      = false   -- SV drag committed (mouse or confirmed touch)
-    local draggingHue     = false   -- Hue drag committed (mouse or confirmed touch)
-    local svPending       = false   -- touch finger down on SV square, direction undecided
-    local huePending      = false   -- touch finger down on hue strip, direction undecided
-    local globalConns     = {}
-    local svTouchStart    = Vector2.zero
-    local hueTouchStart   = 0        -- Y anchor for hue strip drag
-    local hueTouchStartX  = 0        -- X anchor for hue strip horizontal-swipe cancellation
-    local SV_THRESHOLD    = 8   -- pixels before committing to a drag
+    local gestureState  = GestureState.IDLE
+    local gestureStartX = 0
+    local gestureStartY = 0
+    local globalConns   = {}
 
+    -- Lazy ancestor PageCanvas reference — walked once from Row, then cached.
+    -- Rechecked via .Parent to avoid holding a stale destroyed-instance ref.
+    local _pageCanvas = nil
+    local function _getPageCanvas()
+        if _pageCanvas and _pageCanvas.Parent then return _pageCanvas end
+        local anc = Row.Parent
+        while anc do
+            if anc:IsA("ScrollingFrame") then
+                _pageCanvas = anc
+                return anc
+            end
+            anc = anc.Parent
+        end
+        return nil
+    end
+
+    local function _lockPageScroll()
+        local pc = _getPageCanvas()
+        if pc then pcall(function() pc.ScrollingEnabled = false end) end
+    end
+
+    local function _unlockPageScroll()
+        local pc = _getPageCanvas()
+        if pc then pcall(function() pc.ScrollingEnabled = true end) end
+    end
+
+    local function resetGesture()
+        if gestureState == GestureState.SV or gestureState == GestureState.HUE then
+            rebuildColor(true)  -- force fire final exact color on release
+        end
+        gestureState = GestureState.IDLE
+        _unlockPageScroll()  -- always safe to call; no-op if already enabled
+    end
+
+    -- Apply SV update from screen position
+    local function applySV(pos: Vector3)
+        local rel = Vector2.new(pos.X, pos.Y) - SVSquare.AbsolutePosition
+        s = math.clamp(rel.X / SVSquare.AbsoluteSize.X, 0, 1)
+        v = 1 - math.clamp(rel.Y / SVSquare.AbsoluteSize.Y, 0, 1)
+        rebuildColor()
+    end
+
+    -- Apply Hue update from screen position
+    local function applyHue(pos: Vector3)
+        local rel = Vector2.new(pos.X, pos.Y) - HueStrip.AbsolutePosition
+        h = math.clamp(rel.Y / HueStrip.AbsoluteSize.Y, 0, 1)
+        rebuildColor()
+    end
+
+    -- SV square: mouse immediate, touch pending
     table.insert(globalConns, SVSquare.InputBegan:Connect(function(input)
         if not enabled then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            -- Mouse: immediate commit, no threshold needed
-            draggingSV = true
-            local rel  = Vector2.new(input.Position.X, input.Position.Y) - SVSquare.AbsolutePosition
-            s = math.clamp(rel.X / SVSquare.AbsoluteSize.X, 0, 1)
-            v = 1 - math.clamp(rel.Y / SVSquare.AbsoluteSize.Y, 0, 1)
-            rebuildColor()
+            gestureState = GestureState.SV
+            applySV(input.Position)
         elseif input.UserInputType == Enum.UserInputType.Touch then
-            -- Touch: record start, mark pending — do NOT set draggingSV yet.
-            -- Direction is resolved in InputChanged once movement exceeds threshold.
-            svTouchStart = Vector2.new(input.Position.X, input.Position.Y)
-            svPending    = true
-            draggingSV   = false
+            if gestureState == GestureState.IDLE then
+                gestureState  = GestureState.PENDING
+                gestureStartX = input.Position.X
+                gestureStartY = input.Position.Y
+            end
         end
     end))
 
+    -- Hue strip: mouse immediate, touch pending
     table.insert(globalConns, HueStrip.InputBegan:Connect(function(input)
         if not enabled then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            draggingHue = true
-            local rel = Vector2.new(input.Position.X, input.Position.Y) - HueStrip.AbsolutePosition
-            h = math.clamp(rel.Y / HueStrip.AbsoluteSize.Y, 0, 1)
-            rebuildColor()
+            gestureState = GestureState.HUE
+            applyHue(input.Position)
         elseif input.UserInputType == Enum.UserInputType.Touch then
-            hueTouchStart  = input.Position.Y
-            hueTouchStartX = input.Position.X   -- anchor X for horizontal-swipe cancellation
-            huePending     = true
-            draggingHue    = false
+            if gestureState == GestureState.IDLE then
+                gestureState  = GestureState.PENDING
+                gestureStartX = input.Position.X
+                gestureStartY = input.Position.Y
+            end
         end
     end))
 
+    -- Global InputChanged: intent classification + locked updates
     table.insert(globalConns, UserInputService.InputChanged:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not enabled then return end
 
-        local pos = Vector2.new(input.Position.X, input.Position.Y)
+        -- ── Mouse drag ────────────────────────────────────────────────────
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            if gestureState == GestureState.SV then
+                applySV(input.Position)
+            elseif gestureState == GestureState.HUE then
+                applyHue(input.Position)
+            end
+            return
+        end
 
-        -- ── Resolve SV pending state ──────────────────────────────────────
-        if svPending and input.UserInputType == Enum.UserInputType.Touch then
-            local delta = pos - svTouchStart
-            if delta.Magnitude >= SV_THRESHOLD then
-                svPending = false
-                if math.abs(delta.Y) > math.abs(delta.X) * 1.5 then
-                    -- Vertical scroll intent dominates — yield to scroll container
-                    draggingSV = false
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+        -- ── PENDING: classify intent ──────────────────────────────────────
+        if gestureState == GestureState.PENDING then
+            local dx = math.abs(input.Position.X - gestureStartX)
+            local dy = math.abs(input.Position.Y - gestureStartY)
+            local totalDelta = math.sqrt(dx * dx + dy * dy)
+
+            if totalDelta >= GESTURE_THRESHOLD then
+                -- Classify once and LOCK — never re-classifies for this gesture
+                if dy >= dx * HUE_DOMINANCE then
+                    local hueAbsX = HueStrip.AbsolutePosition.X
+                    local hueAbsW = HueStrip.AbsoluteSize.X
+                    if gestureStartX >= hueAbsX and gestureStartX <= hueAbsX + hueAbsW then
+                        gestureState = GestureState.HUE
+                        _lockPageScroll()  -- own the gesture; prevent PageCanvas scroll
+                    else
+                        -- Vertical on SV square = yield to page scroll
+                        gestureState = GestureState.YIELDED
+                        -- Do NOT lock — page scroll should have this one
+                    end
                 else
-                    -- Horizontal (2D paint) intent confirmed — commit to SV drag
-                    draggingSV = true
+                    -- Horizontal or 2D intent on SV square = SV drag
+                    gestureState = GestureState.SV
+                    _lockPageScroll()  -- own the gesture; prevent PageCanvas scroll
                 end
             end
+            -- Under threshold: stay PENDING
+            return
         end
 
-        -- ── Resolve Hue pending state ─────────────────────────────────────
-        if huePending and input.UserInputType == Enum.UserInputType.Touch then
-            local dy = math.abs(input.Position.Y - hueTouchStart)
-            local dx = math.abs(input.Position.X - hueTouchStartX)
-            if dy >= SV_THRESHOLD then
-                huePending  = false
-                draggingHue = true   -- hue strip is vertical-only, clear vertical motion commits
-            elseif dx > SV_THRESHOLD then
-                -- Horizontal swipe — not a hue drag; yield to page scroll
-                huePending  = false
-                draggingHue = false
-            end
+        -- ── LOCKED: apply color update ────────────────────────────────────
+        -- gestureState is SV, HUE, or YIELDED — none of these re-classify.
+        if gestureState == GestureState.SV then
+            applySV(input.Position)
+        elseif gestureState == GestureState.HUE then
+            applyHue(input.Position)
         end
-
-        -- ── Apply committed drags ─────────────────────────────────────────
-        if draggingSV then
-            local rel = pos - SVSquare.AbsolutePosition
-            s = math.clamp(rel.X / SVSquare.AbsoluteSize.X, 0, 1)
-            v = 1 - math.clamp(rel.Y / SVSquare.AbsoluteSize.Y, 0, 1)
-            rebuildColor()
-        elseif draggingHue then
-            local rel = pos - HueStrip.AbsolutePosition
-            h = math.clamp(rel.Y / HueStrip.AbsoluteSize.Y, 0, 1)
-            rebuildColor()
-        end
+        -- YIELDED: do nothing, page scroll has ownership
     end))
 
+    -- Release: unconditionally reset gesture state
     table.insert(globalConns, UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
-            draggingSV  = false
-            draggingHue = false
-            svPending   = false
-            huePending  = false
+            resetGesture()
         end
     end))
 
@@ -3539,10 +3969,10 @@ function ColorPicker.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(Row, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(rowStroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(HexLabel, nil, { TextColor3 = tokens.SubText })
+        TweenHelper.Tween(Row,        nil, { BackgroundColor3 = tokens.Surface  })
+        TweenHelper.Tween(rowStroke,  nil, { Color = tokens.Border              })
+        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text           })
+        TweenHelper.Tween(HexLabel,   nil, { TextColor3 = tokens.SubText        })
         if descLabel then
             TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
         end
@@ -3550,38 +3980,42 @@ function ColorPicker.New(parent: Instance, config: table)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get(): Color3
         return currentColor
     end
 
+    function api:GetDisplay(): string
+        return toHex(currentColor)
+    end
+
     function api:Set(color: Color3)
-        -- Decompose to HSV for the picker UI, then restore the exact Color3
-        -- so Get() returns the same reference that was passed in.
-        -- (Color3.fromHSV round-trips introduce sub-LSB float drift.)
         h, s, v = toHSV(color)
         rebuildColor()
-        currentColor = color   -- overwrite the fromHSV-derived value with the exact input
+        currentColor = color
         Swatch.BackgroundColor3 = color
     end
 
     function api:Enable()
         enabled = true
-        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
-            TextColor3 = ThemeEngine.GetToken("Text"),
-        })
+        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo,
+            { TextColor3 = ThemeEngine.GetToken("Text") })
     end
 
     function api:Disable()
         enabled = false
+        resetGesture()
         if isOpen then
             isOpen = false
             TweenHelper.Tween(Row, TweenHelper.FastInfo, { Size = UDim2.new(1, 0, 0, 42) })
         end
-        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
-            TextColor3 = ThemeEngine.GetToken("DisabledText"),
-        })
+        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo,
+            { TextColor3 = ThemeEngine.GetToken("DisabledText") })
     end
 
     function api:SetTitle(t: string) titleLabel.Text = t end
@@ -3590,10 +4024,9 @@ function ColorPicker.New(parent: Instance, config: table)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        resetGesture()
         themeDisconnect()
-        for _, conn in ipairs(globalConns) do
-            conn:Disconnect()
-        end
+        for _, conn in ipairs(globalConns) do conn:Disconnect() end
         table.clear(globalConns)
         OnChanged:Destroy()
         Row:Destroy()
@@ -3643,11 +4076,13 @@ function Divider.New(parent: Instance, config: table)
     })
 
     -- Left line
+    -- When hasLabel: start at size 0, signal resizes after label width is known.
+    -- When no label: full width immediately (no dynamic resize needed).
     local leftLine = ComponentHelper.Create("Frame", {
         Name             = "LineLeft",
         AnchorPoint      = Vector2.new(0, 0.5),
         Position         = UDim2.new(0, 0, 0.5, 0),
-        Size             = hasLabel and UDim2.new(0.5, -6, 0, 1) or UDim2.new(1, 0, 0, 1),
+        Size             = hasLabel and UDim2.new(0, 0, 0, 1) or UDim2.new(1, 0, 0, 1),  -- sized by signal when hasLabel
         BackgroundColor3 = ThemeEngine.GetToken("Border"),
         BorderSizePixel  = 0,
         Parent           = frame,
@@ -3658,11 +4093,14 @@ function Divider.New(parent: Instance, config: table)
 
     if hasLabel then
         -- Right line
+        -- Initial size 0: the AbsoluteSize signal below resizes both lines once
+        -- the label's width is known. Starting at 0 prevents a one-frame overlap
+        -- where the 50%-6px default extends over the label before the signal fires.
         rightLine = ComponentHelper.Create("Frame", {
             Name             = "LineRight",
             AnchorPoint      = Vector2.new(1, 0.5),
             Position         = UDim2.new(1, 0, 0.5, 0),
-            Size             = UDim2.new(0.5, -6, 0, 1),
+            Size             = UDim2.new(0, 0, 0, 1),  -- sized by signal below
             BackgroundColor3 = ThemeEngine.GetToken("Border"),
             BorderSizePixel  = 0,
             Parent           = frame,
@@ -3686,15 +4124,31 @@ function Divider.New(parent: Instance, config: table)
 
         -- Resize lines dynamically so they never overlap the label regardless of
         -- text length. 8px gap on each side of the label gives breathing room.
+        --
+        -- Three-path approach (race fix):
+        --   Signal 1: textLabel.AbsoluteSize fires when text width is known.
+        --   Signal 2: frame.AbsoluteSize     fires when parent container resolves its width.
+        --   Fallback: task.defer fires one frame after construction — by then Roblox's
+        --             layout engine has resolved ALL AbsoluteSize values. This catches
+        --             the race where both signals fire on the same frame with stale zeros
+        --             (both guard early, both stabilize, neither fires again).
         local GAP = 8
-        textLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        local function _resizeLines()
             local labelHalf = textLabel.AbsoluteSize.X / 2
             local frameW    = frame.AbsoluteSize.X
+            -- Skip only if BOTH are zero (frame truly not laid out yet).
+            -- If frameW is resolved but labelHalf is still 0, lineW = frameW/2 - GAP
+            -- which is correct for a zero-width label edge case.
             if frameW <= 0 then return end
             local lineW = math.max(0, (frameW / 2) - labelHalf - GAP)
             leftLine.Size  = UDim2.new(0, lineW, 0, 1)
             rightLine.Size = UDim2.new(0, lineW, 0, 1)
-        end)
+        end
+
+        textLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines)
+        frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines)
+        -- Deferred fallback: runs after the current layout pass fully resolves.
+        task.defer(_resizeLines)
     end
 
     -- ─── Theme updates ───────────────────────────────────────────────────────
@@ -3755,6 +4209,41 @@ function Dropdown.New(parent: Instance, config: table)
         or (isMulti and {} or (options[1] or ""))
 
     local OnChanged = Signal.new()
+
+    -- ─── Parent PageCanvas scroll suppression ──────────────────────────────
+    -- Root cause of dropdown scroll moving the page:
+    --   OptionScroll is a ScrollingFrame nested inside the Tab's PageCanvas
+    --   (also a ScrollingFrame). Roblox propagates scroll events up to the
+    --   parent when the inner frame hits its top/bottom edge. While the
+    --   dropdown is open, the user intends to scroll the option list — not
+    --   the page. Fix: disable ScrollingEnabled on the ancestor PageCanvas
+    --   while the dropdown is open; restore on close.
+    local _pageCanvas = nil
+    local function _lockPageCanvas()
+        pcall(function()
+            if _pageCanvas and _pageCanvas.Parent then
+                _pageCanvas.ScrollingEnabled = false
+                return
+            end
+            -- Walk ancestors to find and cache the page ScrollingFrame.
+            local anc = Row and Row.Parent
+            while anc do
+                if anc:IsA("ScrollingFrame") then
+                    _pageCanvas = anc
+                    _pageCanvas.ScrollingEnabled = false
+                    return
+                end
+                anc = anc.Parent
+            end
+        end)
+    end
+    local function _unlockPageCanvas()
+        pcall(function()
+            if _pageCanvas and _pageCanvas.Parent then
+                _pageCanvas.ScrollingEnabled = true
+            end
+        end)
+    end
 
     -- ─── Row container ─────────────────────────────────────────────────────
 
@@ -3935,7 +4424,7 @@ function Dropdown.New(parent: Instance, config: table)
                     })
                 end
             end))
-            table.insert(optionConns, Btn.MouseButton1Click:Connect(function()
+            table.insert(optionConns, Btn.Activated:Connect(function()
                 if not enabled then return end
                 if isMulti then
                     local foundIdx = table.find(currentSelection, opt)
@@ -3950,8 +4439,15 @@ function Dropdown.New(parent: Instance, config: table)
                     SelectedText.Text = tostring(opt)
                     -- Auto-close on single select
                     isOpen = false
-                    TweenHelper.Tween(Row, TweenHelper.FastInfo, { Size = UDim2.new(1, 0, 0, 42) })
-                    TweenHelper.Tween(Arrow, TweenHelper.FastInfo, { Rotation = 0 })
+                    _unlockPageCanvas()  -- restore page scroll after selection
+                    TweenHelper.Tween(OptionScroll, TweenHelper.FastInfo, { Size = UDim2.new(1, -16, 0, 0)  })
+                    TweenHelper.Tween(Row,          TweenHelper.FastInfo, { Size = UDim2.new(1, 0,   0, 42) })
+                    TweenHelper.Tween(Arrow,        TweenHelper.FastInfo, { Rotation = 0                    })
+                    task.delay(TweenHelper.FastInfo.Time, function()
+                        if not isOpen then
+                            OptionScroll.Visible = false
+                        end
+                    end)
                 end
                 RenderOptions()
                 OnChanged:Fire(currentSelection)
@@ -3961,12 +4457,16 @@ function Dropdown.New(parent: Instance, config: table)
 
     -- ─── Open / close ──────────────────────────────────────────────────────
 
+    OptionScroll.Visible = false  -- start hidden
+
     -- BUG-02 fix: store the Trigger connection so api:Destroy() can clean it.
-    local triggerConn = Trigger.MouseButton1Click:Connect(function()
+    local triggerConn = Trigger.Activated:Connect(function()
         if not enabled then return end
         isOpen = not isOpen
         TweenHelper.Tween(Arrow, TweenHelper.FastInfo, { Rotation = isOpen and 180 or 0 })
         if isOpen then
+            OptionScroll.Visible = true
+            _lockPageCanvas()   -- prevent page scroll while option list is open
             -- Defer one frame so AbsoluteContentSize is resolved before reading.
             task.defer(function()
                 if not isOpen then return end
@@ -3978,8 +4478,14 @@ function Dropdown.New(parent: Instance, config: table)
                 TweenHelper.Tween(Row,          TweenHelper.FastInfo, { Size = UDim2.new(1, 0,   0, totalH)  })
             end)
         else
+            _unlockPageCanvas()  -- restore page scroll on close
             TweenHelper.Tween(OptionScroll, TweenHelper.FastInfo, { Size = UDim2.new(1, -16, 0, 0)  })
             TweenHelper.Tween(Row,          TweenHelper.FastInfo, { Size = UDim2.new(1, 0,   0, 42) })
+            task.delay(TweenHelper.FastInfo.Time, function()
+                if not isOpen then
+                    OptionScroll.Visible = false
+                end
+            end)
         end
     end)
 
@@ -3988,25 +4494,34 @@ function Dropdown.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(Row, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(rowStroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(Trigger, nil, { BackgroundColor3 = tokens.SurfaceActive })
-        TweenHelper.Tween(SelectedText, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(Arrow, nil, { TextColor3 = tokens.SubText })
-        if descLabel then
-            TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
-        end
+        Row.BackgroundColor3       = tokens.Surface
+        rowStroke.Color            = tokens.Border
+        titleLabel.TextColor3      = tokens.Text
+        Trigger.BackgroundColor3   = tokens.SurfaceActive
+        SelectedText.TextColor3    = tokens.Text
+        Arrow.TextColor3           = tokens.SubText
+        if descLabel then descLabel.TextColor3 = tokens.SubText end
         -- Re-render option buttons with new theme colors
         RenderOptions()
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get()
         return currentSelection
+    end
+
+    function api:GetDisplay(): string
+        if isMulti then
+            return table.concat(currentSelection, ", ")
+        end
+        return tostring(currentSelection)
     end
 
     function api:Set(val)
@@ -4041,6 +4556,7 @@ function Dropdown.New(parent: Instance, config: table)
         enabled = false
         if isOpen then
             isOpen = false
+            _unlockPageCanvas()
             TweenHelper.Tween(Row, TweenHelper.FastInfo, { Size = UDim2.new(1, 0, 0, 42) })
             TweenHelper.Tween(Arrow, TweenHelper.FastInfo, { Rotation = 0 })
         end
@@ -4055,6 +4571,7 @@ function Dropdown.New(parent: Instance, config: table)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        _unlockPageCanvas()  -- always restore scroll on destroy
         triggerConn:Disconnect()
         for _, conn in ipairs(optionConns) do
             conn:Disconnect()
@@ -4099,7 +4616,24 @@ function Keybind.New(parent: Instance, config: table)
     local enabled    = true
     local isListening = false
 
-    local OnChanged = Signal.new()
+    local OnChanged   = Signal.new()
+    local OnActivated = Signal.new()  -- fires when the bound key is pressed in-game
+
+    -- Persistent key-press listener: runs always (not just while listening).
+    -- Fires OnActivated + config.Callback whenever the currently bound key is pressed.
+    -- NOTE: gameProcessed guard omitted intentionally — see Keybind.lua comment on
+    -- listen-mode globalConn for the same reason (DisplayOrder=100 marks all inputs
+    -- as gameProcessed=true even when window is hidden).
+    local _activateConn = UserInputService.InputBegan:Connect(function(input, _)
+        if not enabled then return end
+        if isListening then return end  -- don't fire while assigning a new key
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if input.KeyCode ~= currentKey then return end
+        OnActivated:Fire(currentKey)
+        if config.Callback then
+            pcall(config.Callback, currentKey)
+        end
+    end)
 
     -- ─── Row ───────────────────────────────────────────────────────────────
 
@@ -4194,18 +4728,18 @@ function Keybind.New(parent: Instance, config: table)
         })
     end
 
-    -- Hover states on BindBtn
+    -- Hover states on BindBtn — always re-read live token so theme switches apply
     local hoverConn1 = BindBtn.MouseEnter:Connect(function()
         if not enabled or isListening then return end
         TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
             BackgroundColor3 = ThemeEngine.GetToken("SurfaceHover"),
-        })
+        }, "btn_hover")
     end)
     local hoverConn2 = BindBtn.MouseLeave:Connect(function()
         if not enabled or isListening then return end
         TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
             BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
-        })
+        }, "btn_hover")
     end)
 
     BindBtn.MouseButton1Click:Connect(function()
@@ -4231,8 +4765,11 @@ function Keybind.New(parent: Instance, config: table)
             end)
         end
 
-        globalConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-            if gameProcessed then return end
+        globalConn = UserInputService.InputBegan:Connect(function(input, _gameProcessed)
+            -- NOTE: gameProcessed guard intentionally omitted.
+            -- With DisplayOrder=100, Roblox marks inputs as GUI-processed even
+            -- when window contents are hidden (ScreenGui still exists). Guarding
+            -- on gameProcessed would block keybind presses while window is hidden.
             if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
             if input.KeyCode == Enum.KeyCode.Escape then
                 stopListening()
@@ -4249,25 +4786,35 @@ function Keybind.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(Row, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(rowStroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(BindBtn, nil, { BackgroundColor3 = tokens.SurfaceActive })
+        -- Direct property sets (no tween) so hidden-tab components always
+        -- hold the correct color when their PageCanvas becomes Visible again.
+        Row.BackgroundColor3   = tokens.Surface
+        rowStroke.Color        = tokens.Border
+        titleLabel.TextColor3  = tokens.Text
+        BindBtn.BackgroundColor3 = tokens.SurfaceActive
         if not isListening then
-            TweenHelper.Tween(BindBtn, nil, { TextColor3 = tokens.Text })
-            TweenHelper.Tween(btnStroke, nil, { Color = tokens.Border })
+            BindBtn.TextColor3 = tokens.Text
+            btnStroke.Color    = tokens.Border
         end
         if descLabel then
-            TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
+            descLabel.TextColor3 = tokens.SubText
         end
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get(): Enum.KeyCode
         return currentKey
+    end
+
+    function api:GetDisplay(): string
+        return currentKey and currentKey.Name or "None"
     end
 
     function api:Set(key: Enum.KeyCode)
@@ -4308,15 +4855,18 @@ function Keybind.New(parent: Instance, config: table)
     function api:Destroy()
         if globalConn then globalConn:Disconnect() end
         if timeoutThread then pcall(task.cancel, timeoutThread) end
+        _activateConn:Disconnect()
         hoverConn1:Disconnect()
         hoverConn2:Disconnect()
         themeDisconnect()
         OnChanged:Destroy()
+        OnActivated:Destroy()
         Row:Destroy()
     end
 
-    api.Instance  = Row
-    api.OnChanged = OnChanged
+    api.Instance    = Row
+    api.OnChanged   = OnChanged
+    api.OnActivated = OnActivated
 
     return api
 end
@@ -4372,12 +4922,14 @@ function Label.New(parent: Instance, config: table)
     ComponentHelper.AddCorner(frame, 6)
     ComponentHelper.AddPadding(frame, 4, 4, 12, 12)
 
+    local hasValue = tostring(value) ~= ""
+
     local titleLabel = ComponentHelper.Create("TextLabel", {
         Name               = "Title",
-        Size               = UDim2.new(0.6, 0, 1, 0),
+        Size               = hasValue and UDim2.new(0.55, 0, 1, 0) or UDim2.new(1, 0, 1, 0),
         BackgroundTransparency = 1,
         Text               = title,
-        TextColor3         = ThemeEngine.GetToken("SubText"),
+        TextColor3         = hasValue and ThemeEngine.GetToken("SubText") or ThemeEngine.GetToken("Text"),
         TextSize           = 12,
         Font               = Enum.Font.GothamMedium,
         TextXAlignment     = Enum.TextXAlignment.Left,
@@ -4387,8 +4939,8 @@ function Label.New(parent: Instance, config: table)
 
     local valueLabel = ComponentHelper.Create("TextLabel", {
         Name               = "Value",
-        Position           = UDim2.new(0.6, 0, 0, 0),
-        Size               = UDim2.new(0.4, 0, 1, 0),
+        Position           = UDim2.new(0.55, 0, 0, 0),
+        Size               = UDim2.new(0.45, 0, 1, 0),
         BackgroundTransparency = 1,
         Text               = tostring(value),
         TextColor3         = ThemeEngine.GetToken(valueToken),
@@ -4396,14 +4948,25 @@ function Label.New(parent: Instance, config: table)
         Font               = Enum.Font.GothamBold,
         TextXAlignment     = Enum.TextXAlignment.Right,
         TextTruncate       = Enum.TextTruncate.AtEnd,
+        Visible            = hasValue,
         Parent             = frame,
     })
+
+    local function _updateLayout()
+        local curValue = valueLabel.Text
+        local isVal = curValue ~= ""
+        titleLabel.Size = isVal and UDim2.new(0.55, 0, 1, 0) or UDim2.new(1, 0, 1, 0)
+        titleLabel.TextColor3 = isVal and ThemeEngine.GetToken("SubText") or ThemeEngine.GetToken("Text")
+        valueLabel.Visible = isVal
+    end
 
     -- ─── Theme updates ───────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
         TweenHelper.Tween(frame,       nil, {BackgroundColor3 = tokens.Surface})
-        TweenHelper.Tween(titleLabel,  nil, {TextColor3 = tokens.SubText})
+        local curValue = valueLabel.Text
+        local isVal = curValue ~= ""
+        TweenHelper.Tween(titleLabel,  nil, {TextColor3 = isVal and tokens.SubText or tokens.Text})
         TweenHelper.Tween(valueLabel,  nil, {TextColor3 = tokens[valueToken]})
     end)
 
@@ -4413,10 +4976,12 @@ function Label.New(parent: Instance, config: table)
 
     function api:SetTitle(text: string)
         titleLabel.Text = tostring(text)
+        _updateLayout()
     end
 
     function api:SetValue(text: string | number)
         valueLabel.Text = tostring(text)
+        _updateLayout()
     end
 
     function api:SetVariant(v: string)
@@ -4452,6 +5017,8 @@ _Delirium_modules["Components.Paragraph"] = function()
 --       Title = "About",  -- optional
 --       Content = "Long text that wraps across multiple lines...",
 --   })
+
+local TextService     = game:GetService("TextService")
 -- local Root            = script.Parent.Parent
 local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
@@ -4507,23 +5074,82 @@ function Paragraph.New(parent: Instance, config: table)
     end
 
     -- Body text.
-    -- LineHeight 1.4 is a newer Roblox property; wrap the assignment in pcall
-    -- so older runtimes don't silently error and leave the label invisible.
+    -- ROOT-CAUSE FIX: using AutomaticSize.Y on a TextLabel that is itself inside
+    -- an AutomaticSize.Y frame which is inside another AutomaticSize.Y container
+    -- creates a 3-level chain. Roblox's layout engine can silently resolve this
+    -- to 0 height on some runtime versions (mobile especially). Fix: measure the
+    -- text height explicitly via TextService and set a concrete pixel Size.Y.
+    -- Recompute whenever the frame width or text changes so wrap rows stay accurate.
+    local TEXT_SIZE = 12
+    local TEXT_FONT = Enum.Font.Gotham
+    local SIDE_PAD  = 24  -- 12px left + 12px right from AddPadding
+
     local bodyLabel = ComponentHelper.Create("TextLabel", {
         Name               = "Body",
-        Size               = UDim2.new(1, 0, 0, 0),
-        AutomaticSize      = Enum.AutomaticSize.Y,
+        Size               = UDim2.new(1, 0, 0, TEXT_SIZE + 4),  -- 1-line fallback
+        AutomaticSize      = Enum.AutomaticSize.None,             -- measured manually below
         BackgroundTransparency = 1,
         Text               = content,
         TextColor3         = ThemeEngine.GetToken("SubText"),
-        TextSize           = 12,
-        Font               = Enum.Font.Gotham,
+        TextSize           = TEXT_SIZE,
+        Font               = TEXT_FONT,
         TextXAlignment     = Enum.TextXAlignment.Left,
         TextWrapped        = true,
         LayoutOrder        = 1,
         Parent             = frame,
     })
     pcall(function() bodyLabel.LineHeight = 1.4 end)
+
+    -- Measure and apply correct body height.
+    local function _measureBody()
+        local availW = frame.AbsoluteSize.X - SIDE_PAD
+        if availW <= 4 then return end  -- frame not laid out yet
+
+        local txt  = bodyLabel.Text ~= "" and bodyLabel.Text or " "
+        local measured = false
+
+        -- Primary: GetTextBoundsAsync (Roblox 2024+ API).
+        -- IMPORTANT: params.Font requires a Font OBJECT (Font.fromEnum), NOT an
+        -- Enum.Font EnumItem. Assigning an EnumItem throws "Font expected, got EnumItem"
+        -- even before the pcall would catch it, so ALL params setup goes inside the pcall.
+        local ok, bounds = pcall(function()
+            local params = Instance.new("GetTextBoundsParams")
+            params.Text  = txt
+            params.Font  = Font.fromEnum(TEXT_FONT)  -- Font object required
+            params.Size  = TEXT_SIZE
+            params.Width = availW
+            return TextService:GetTextBoundsAsync(params)
+        end)
+        if ok and bounds then
+            local h = math.max(TEXT_SIZE + 4, math.ceil(bounds.Y))
+            bodyLabel.Size = UDim2.new(1, 0, 0, h)
+            measured = true
+        end
+
+        -- Fallback: GetTextSize (deprecated but still available in most executors)
+        if not measured then
+            local ok2, sz = pcall(function()
+                return TextService:GetTextSize(txt, TEXT_SIZE, TEXT_FONT,
+                    Vector2.new(availW, 9999))
+            end)
+            if ok2 and sz then
+                bodyLabel.Size = UDim2.new(1, 0, 0, math.max(TEXT_SIZE + 4, math.ceil(sz.Y)))
+            end
+        end
+    end
+
+    -- Re-measure when frame width settles (resolves 1-scale children after parent layout).
+    frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_measureBody)
+
+    -- Re-measure when text changes (SetContent / Append calls update Text synchronously,
+    -- so defer one frame to let the frame width be current before measuring).
+    bodyLabel:GetPropertyChangedSignal("Text"):Connect(function()
+        task.defer(_measureBody)
+    end)
+
+    -- Initial measure: defer one frame so the parent container resolves its AbsoluteSize
+    -- before we try to read frame.AbsoluteSize.X (which would be 0 if we read it now).
+    task.defer(_measureBody)
 
     -- ─── Theme updates ───────────────────────────────────────────────────────
 
@@ -4548,6 +5174,7 @@ function Paragraph.New(parent: Instance, config: table)
 
     function api:SetContent(text: string)
         bodyLabel.Text = tostring(text)
+        -- _measureBody fires automatically via bodyLabel.Text signal above
     end
 
     -- Append text on a new line.
@@ -4574,8 +5201,15 @@ end
 -- ── Components.Slider ─────────────────────────────────────
 _Delirium_modules["Components.Slider"] = function()
 -- Components/Slider.lua
--- Touch threshold: slider drag only starts after clear horizontal intent,
--- preventing accidental activation during scroll gestures.
+-- Gesture ownership model:
+--   Touch begin  → PENDING (dragging=false, value unchanged)
+--   First move   → measure dx vs dy from start position
+--   dx > dy*1.5 AND dx > THRESHOLD → HORIZONTAL intent → Slider owns gesture
+--   dy > THRESHOLD (and dx not dominant) → VERTICAL intent → yield to page scroll
+--   Mouse: immediate drag, no threshold needed
+--
+-- Key invariant: applyValue is NEVER called during PENDING state.
+-- Value only changes after gesture ownership is confirmed (touchDragReady=true).
 
 local UserInputService = game:GetService("UserInputService")
 -- local Root             = script.Parent.Parent
@@ -4586,16 +5220,15 @@ local Signal           = _Delirium_require("Utilities.Signal")
 
 local Slider = {}
 
--- Touch drag is only initiated once horizontal movement exceeds this threshold,
--- avoiding accidental activation during vertical scroll gestures.
-local TOUCH_DRAG_THRESHOLD = 6 -- pixels
+local TOUCH_DRAG_THRESHOLD = 10  -- px before intent is classified (raised from 6 — less hair-trigger)
+local HORIZONTAL_DOMINANCE = 1.8 -- dx must be this many times dy to confirm horizontal intent
 
 function Slider.New(parent: Instance, config: table)
     config = config or {}
-    local min       = config.Min      or 0
-    local max       = config.Max      or 100
+    local min       = config.Min       or 0
+    local max       = config.Max       or 100
     local precision = config.Precision or 0
-    local callback  = config.Callback or function() end
+    local callback  = config.Callback  or function() end
     local enabled   = true
     local value     = math.clamp(config.Default or min, min, max)
 
@@ -4656,11 +5289,10 @@ function Slider.New(parent: Instance, config: table)
     })
     ComponentHelper.AddCorner(fill, 3)
 
-    -- Invisible wider hit area on top of track (easier to grab)
     local hitArea = ComponentHelper.Create("TextButton", {
         Name               = "HitArea",
-        Size               = UDim2.new(1, 0, 0, 20),
-        Position           = UDim2.new(0, 0, 0.5, -10),
+        Size               = UDim2.new(1, 0, 0, 44),  -- taller hit area for mobile
+        Position           = UDim2.new(0, 0, 0.5, -22),
         BackgroundTransparency = 1,
         Text               = "",
         Parent             = track,
@@ -4673,114 +5305,156 @@ function Slider.New(parent: Instance, config: table)
     -- ─── Value logic ───────────────────────────────────────────────────────
 
     local function computeValue(screenX: number): number
-        local pct  = math.clamp((screenX - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-        local raw  = min + pct * (max - min)
+        local pct    = math.clamp((screenX - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local raw    = min + pct * (max - min)
         local factor = 10 ^ precision
         return math.round(raw * factor) / factor
     end
 
-    local function applyValue(newVal: number, fireSignal: boolean)
-        if newVal == value then return end
+    local lastFireTime  = 0
+    local FIRE_THROTTLE = 0.035  -- max ~28 Hz signal fire rate during rapid drag
+
+    local function applyValue(newVal: number, forceFire: boolean?)
+        local valueChanged = (newVal ~= value)
+        if not valueChanged and not forceFire then return end
         value = newVal
         valueLabel.Text = tostring(value)
         local ratio = (value - min) / (max - min)
         TweenHelper.Tween(fill, TweenHelper.FastInfo, { Size = UDim2.new(ratio, 0, 1, 0) })
-        if fireSignal then
+
+        local now = os.clock()
+        if forceFire or (valueChanged and (now - lastFireTime >= FIRE_THROTTLE)) then
+            lastFireTime = now
             OnChanged:Fire(value)
-            task.spawn(callback, value)
         end
     end
 
-    -- ─── Input handling (scoped connections — no global leak) ──────────────
+    -- ─── Gesture state ─────────────────────────────────────────────────────
+    --
+    -- Three-state touch machine:
+    --   IDLE         dragging=false, touchPending=false
+    --   PENDING      dragging=false, touchPending=true   ← value NEVER changes here
+    --   OWNING       dragging=true,  touchPending=false  ← slider owns gesture
+    --   YIELDED      dragging=false, touchPending=false  ← page scroll owns, slider stays idle
+    --
+    -- Mouse has no PENDING state — immediately enters OWNING on MouseButton1Down.
 
-    local dragging       = false
-    local touchStartX    = 0
-    local touchStartY    = 0    -- tracked alongside X for delta-based direction detection
-    local touchDragReady = false  -- true once horizontal intent confirmed
-    local globalConns    = {}
+    local dragging     = false   -- true = slider owns gesture, value updates allowed
+    local touchPending = false   -- true = finger down, intent not yet classified
+    local touchStartX  = 0
+    local touchStartY  = 0
+    local globalConns  = {}
 
-    local function startDrag(screenX: number)
-        dragging = true
-        applyValue(computeValue(screenX), true)
+    local function resetGesture()
+        if dragging then
+            applyValue(value, true)  -- force fire exact final value on release
+        end
+        dragging     = false
+        touchPending = false
     end
 
-    local function stopDrag()
-        dragging      = false
-        touchDragReady = false
-    end
-
-    -- Track / hitArea: begin drag on mouse down (stored so Destroy cleans it)
+    -- Mouse: no threshold, immediate ownership.
+    -- M1 fix: MouseButton1Down fires for Touch inputs too (Roblox fires it as a
+    -- compatibility alias whenever a finger taps a TextButton). Without this guard,
+    -- every finger-down on the Slider immediately calls applyValue and snaps the
+    -- knob — bypassing the PENDING → intent-classification pipeline entirely and
+    -- changing the value even when the user only intends to scroll the page.
+    --
+    -- Roblox's event ordering guarantees InputBegan(Touch) fires BEFORE
+    -- MouseButton1Down, so GetLastInputType() already returns Touch by the time
+    -- this handler runs. Touch ownership is handled by the InputBegan → PENDING
+    -- → InputChanged chain; we only want MouseButton1Down for real mouse clicks.
     table.insert(globalConns, hitArea.MouseButton1Down:Connect(function()
         if not enabled then return end
-        startDrag(UserInputService:GetMouseLocation().X)
+        if UserInputService:GetLastInputType() == Enum.UserInputType.Touch then return end
+        dragging     = true
+        touchPending = false
+        applyValue(computeValue(UserInputService:GetMouseLocation().X))
     end))
 
-    -- Touch: begin on InputBegan, confirm horizontal intent before dragging
+    -- Touch begin: enter PENDING, record start position, do NOT change value
     table.insert(globalConns, hitArea.InputBegan:Connect(function(input)
         if not enabled then return end
-        if input.UserInputType == Enum.UserInputType.Touch then
-            touchStartX    = input.Position.X
-            touchStartY    = input.Position.Y   -- anchor both axes from touch start
-            touchDragReady = false
-            dragging       = true
-        end
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        touchStartX  = input.Position.X
+        touchStartY  = input.Position.Y
+        touchPending = true
+        dragging     = false  -- ownership NOT confirmed yet
     end))
 
-    -- Global move: handle both mouse drag and touch drag
+    -- Global move: intent classification + value update
     table.insert(globalConns, UserInputService.InputChanged:Connect(function(input)
-        if not dragging then return end
         if not enabled then return end
 
+        -- ── Mouse drag ────────────────────────────────────────────────────
         if input.UserInputType == Enum.UserInputType.MouseMovement then
-            applyValue(computeValue(input.Position.X), true)
+            if dragging then
+                applyValue(computeValue(input.Position.X))
+            end
+            return
+        end
 
-        elseif input.UserInputType == Enum.UserInputType.Touch then
-            -- Use delta from touch *start* (not from hitArea center) so diagonal
-            -- intent detection is based on actual finger movement direction.
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+        -- ── Touch: classify intent while PENDING ──────────────────────────
+        if touchPending then
             local dx = math.abs(input.Position.X - touchStartX)
             local dy = math.abs(input.Position.Y - touchStartY)
+            local totalDelta = math.sqrt(dx * dx + dy * dy)
 
-            if not touchDragReady then
-                -- Confirm horizontal intent: horizontal delta must dominate vertical
-                if dx > TOUCH_DRAG_THRESHOLD and dx > dy * 1.5 then
-                    touchDragReady = true
-                elseif dy > TOUCH_DRAG_THRESHOLD then
-                    -- Vertical scroll intent — cancel drag, yield to scroll
-                    stopDrag()
+            if totalDelta >= TOUCH_DRAG_THRESHOLD then
+                touchPending = false  -- leave PENDING regardless of direction
+                if dx >= dy * HORIZONTAL_DOMINANCE then
+                    -- Horizontal intent confirmed → slider owns gesture
+                    dragging = true
+                else
+                    -- Vertical or ambiguous → yield to page scroll, stay IDLE
+                    dragging = false
                 end
             end
+            -- Still under threshold: remain PENDING, do nothing
+            return
+        end
 
-            if touchDragReady then
-                applyValue(computeValue(input.Position.X), true)
-            end
+        -- ── Touch: OWNING → update value ──────────────────────────────────
+        if dragging then
+            applyValue(computeValue(input.Position.X))
         end
     end))
 
-    -- Global end: stop dragging
+    -- Release: always reset gesture state
     table.insert(globalConns, UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
-            stopDrag()
+            resetGesture()
         end
     end))
 
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(frame, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(stroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(valueLabel, nil, { TextColor3 = tokens.SubText })
-        TweenHelper.Tween(track, nil, { BackgroundColor3 = tokens.SliderTrack })
-        TweenHelper.Tween(fill, nil, { BackgroundColor3 = tokens.Accent })
+        frame.BackgroundColor3  = tokens.Surface
+        stroke.Color            = tokens.Border
+        titleLabel.TextColor3   = tokens.Text
+        valueLabel.TextColor3   = tokens.SubText
+        track.BackgroundColor3  = tokens.SliderTrack
+        fill.BackgroundColor3   = tokens.Accent
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get(): number
         return value
+    end
+
+    function api:GetDisplay(): string
+        return tostring(value)
     end
 
     function api:Set(val: number)
@@ -4797,22 +5471,19 @@ function Slider.New(parent: Instance, config: table)
 
     function api:Enable()
         enabled = true
-        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
-            TextColor3 = ThemeEngine.GetToken("Text"),
-        })
-        TweenHelper.Tween(fill, TweenHelper.FastInfo, {
-            BackgroundColor3 = ThemeEngine.GetToken("Accent"),
-        })
+        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo,
+            { TextColor3 = ThemeEngine.GetToken("Text") })
+        TweenHelper.Tween(fill, TweenHelper.FastInfo,
+            { BackgroundColor3 = ThemeEngine.GetToken("Accent") })
     end
 
     function api:Disable()
         enabled = false
-        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
-            TextColor3 = ThemeEngine.GetToken("DisabledText"),
-        })
-        TweenHelper.Tween(fill, TweenHelper.FastInfo, {
-            BackgroundColor3 = ThemeEngine.GetToken("DisabledText"),
-        })
+        resetGesture()
+        TweenHelper.Tween(titleLabel, TweenHelper.FastInfo,
+            { TextColor3 = ThemeEngine.GetToken("DisabledText") })
+        TweenHelper.Tween(fill, TweenHelper.FastInfo,
+            { BackgroundColor3 = ThemeEngine.GetToken("DisabledText") })
     end
 
     function api:SetTitle(title: string)
@@ -4823,10 +5494,9 @@ function Slider.New(parent: Instance, config: table)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        resetGesture()
         themeDisconnect()
-        for _, conn in ipairs(globalConns) do
-            conn:Disconnect()
-        end
+        for _, conn in ipairs(globalConns) do conn:Disconnect() end
         table.clear(globalConns)
         OnChanged:Destroy()
         frame:Destroy()
@@ -4873,6 +5543,7 @@ function TextBox.New(parent: Instance, config: table)
         Name             = "TextBoxRow",
         Size             = UDim2.new(1, 0, 0, 42),
         BackgroundColor3 = ThemeEngine.GetToken("Surface"),
+        ClipsDescendants = true,
         BorderSizePixel  = 0,
         Parent           = parent,
     })
@@ -4922,6 +5593,7 @@ function TextBox.New(parent: Instance, config: table)
         TextColor3         = ThemeEngine.GetToken("Text"),
         TextSize           = 12,
         Font               = Enum.Font.Gotham,
+        TextTruncate       = Enum.TextTruncate.AtEnd,   -- clip long text; never overflow row
         ClearTextOnFocus   = config.ClearOnFocus == true,
         TextEditable       = true,
         Parent             = Row,
@@ -4942,12 +5614,35 @@ function TextBox.New(parent: Instance, config: table)
     --       MultilineBox (TextBox, multiline)
     --       Button row: Cancel | Done
 
-    local _editorOpen = false
+    -- ─── Mobile editor state ───────────────────────────────────────────────
+    -- _fullText: canonical value — may contain \n from multiline editor.
+    --            api:Get() returns this; InputBox.Text is display-only (first line).
+    -- _toDisplayText: converts multiline to a compact single-line preview.
+    -- _returnConn: UserInputService listener for Enter key (M6A); cleaned by _closeEditor.
+
+    local _editorOpen    = false
     local _editorBackdrop = nil
+    local _returnConn    = nil
+    local _fullText      = defaultText   -- M6: canonical value across open/close cycles
+
+    local function _toDisplayText(text: string): string
+        -- Show first line + ellipsis when text is multiline.
+        -- Keeps compact InputBox from rendering broken multiline in a 30px box.
+        local firstLine = text:match("([^\n]*)")
+        if firstLine ~= text then
+            return firstLine .. " …"
+        end
+        return text
+    end
 
     local function _closeEditor(commit: boolean)
         if not _editorOpen then return end
         _editorOpen = false
+        -- M6A: disconnect Enter listener so it doesn't fire outside editor lifetime
+        if _returnConn then
+            _returnConn:Disconnect()
+            _returnConn = nil
+        end
         if _editorBackdrop then
             _editorBackdrop:Destroy()
             _editorBackdrop = nil
@@ -4981,10 +5676,14 @@ function TextBox.New(parent: Instance, config: table)
         _editorBackdrop = backdrop
 
         -- Card
-        local CARD_W = math.min(screenGui.AbsoluteSize.X - 32, 420)
+        -- M4 fix: 56px total horizontal margin (28px each side) keeps visible
+        -- breathing room on narrow phones; cap at 360px avoids over-wide cards
+        -- on wider phones. Height is viewport-proportional with a sensible ceiling.
+        local CARD_W = math.min(screenGui.AbsoluteSize.X - 56, 360)
+        local CARD_H = math.min(math.floor(screenGui.AbsoluteSize.Y * 0.45), 240)
         local card = ComponentHelper.Create("Frame", {
             Name             = "TextBoxEditorCard",
-            Size             = UDim2.fromOffset(CARD_W, 260),
+            Size             = UDim2.fromOffset(CARD_W, CARD_H),
             AnchorPoint      = Vector2.new(0.5, 0.5),
             Position         = UDim2.fromScale(0.5, 0.42),  -- slightly above center; keyboard sits below
             BackgroundColor3 = ThemeEngine.GetToken("Surface"),
@@ -5011,12 +5710,17 @@ function TextBox.New(parent: Instance, config: table)
         })
 
         -- Multiline editor box
+        -- M5 fix: NO UIPadding on the TextBox itself.
+        -- Roblox's cursor rendering ignores UIPadding — cursor draws relative to the
+        -- TextBox frame origin, so adding UIPadding shifts text 8px right/down while
+        -- the cursor stays at x=0, producing visible misalignment.
+        -- Card's own 14px UIPadding already provides visual spacing on all sides.
         local editorBox = ComponentHelper.Create("TextBox", {
             Name               = "EditorBox",
             Position           = UDim2.new(0, 0, 0, 30),
             Size               = UDim2.new(1, 0, 1, -80),
             BackgroundColor3   = ThemeEngine.GetToken("InputBackground"),
-            Text               = InputBox.Text,
+            Text               = _fullText,   -- M6: use canonical value, not truncated display
             PlaceholderText    = placeholder,
             PlaceholderColor3  = ThemeEngine.GetToken("SubText"),
             TextColor3         = ThemeEngine.GetToken("Text"),
@@ -5033,7 +5737,7 @@ function TextBox.New(parent: Instance, config: table)
         })
         ComponentHelper.AddCorner(editorBox, 6)
         ComponentHelper.AddStroke(editorBox, ThemeEngine.GetToken("Accent"), 1)
-        ComponentHelper.AddPadding(editorBox, 8, 8, 8, 8)
+        -- M5: AddPadding intentionally removed (cursor misalignment — see above)
 
         -- Button row
         local btnRow = ComponentHelper.Create("Frame", {
@@ -5088,28 +5792,58 @@ function TextBox.New(parent: Instance, config: table)
             end
         end)
 
-        -- Cancel: discard changes
-        backdrop.MouseButton1Click:Connect(function()
-            _closeEditor(false)
-        end)
+        -- M6B fix: backdrop tap does NOT close the editor.
+        -- User must explicitly choose Cancel or Done.
+        -- (backdrop still blocks input to the game below it)
         cancelBtn.MouseButton1Click:Connect(function()
             _closeEditor(false)
         end)
 
-        -- Done: commit text to InputBox and fire signals
+        -- Done: commit text and fire signals
+        -- M6 fix: store in _fullText; show compact display preview in InputBox
+        -- so multiline \n text doesn't break the 30px single-line compact box.
         doneBtn.MouseButton1Click:Connect(function()
             local text = editorBox.Text
-            InputBox.Text = text
+            _fullText      = text
+            InputBox.Text  = _toDisplayText(text)
             _closeEditor(true)
             OnChanged:Fire(text)
             OnSubmit:Fire(text)
         end)
 
-        -- Also commit on Enter (hardware keyboard connected to touch device)
-        editorBox.FocusLost:Connect(function(enterPressed)
-            if enterPressed then
+        -- M6A fix: Enter = Done for MultiLine TextBox.
+        -- FocusLost(enterPressed=true) NEVER fires for MultiLine=true TextBoxes —
+        -- Roblox inserts \n on Enter and does not treat it as a submit gesture.
+        -- Fix: global UserInputService.InputBegan filtered to Return + focused box.
+        -- task.defer runs AFTER Roblox inserts the \n so we can strip it cleanly.
+        _returnConn = UserInputService.InputBegan:Connect(function(input, _)
+            if input.KeyCode ~= Enum.KeyCode.Return then return end
+            if not editorBox:IsFocused() then return end
+            task.defer(function()
+                if not _editorOpen then return end  -- guard: already closed
+                -- Strip the trailing newline Roblox inserted for the Return key
+                local t = editorBox.Text
+                if t:sub(-1) == "\n" then
+                    editorBox.Text = t:sub(1, -2)
+                end
                 local text = editorBox.Text
-                InputBox.Text = text
+                _fullText     = text
+                InputBox.Text = _toDisplayText(text)
+                _closeEditor(true)
+                OnChanged:Fire(text)
+                OnSubmit:Fire(text)
+            end)
+        end)
+
+        -- FocusLost fallback — fires for hardware keyboards on some platforms
+        -- when the editor loses focus for reasons other than Enter (e.g. Done button
+        -- on iOS virtual keyboard which sets enterPressed=false but still dismisses).
+        -- Only commit if the popup is still open (guard against double-commit).
+        editorBox.FocusLost:Connect(function(enterPressed)
+            if enterPressed and _editorOpen then
+                local text = editorBox.Text
+                _fullText     = text
+                InputBox.Text = _toDisplayText(text)
                 _closeEditor(true)
                 OnChanged:Fire(text)
                 OnSubmit:Fire(text)
@@ -5187,31 +5921,37 @@ function TextBox.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(Row, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(rowStroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(InputBox, nil, {
-            BackgroundColor3 = tokens.InputBackground,
-            TextColor3       = tokens.Text,
-            PlaceholderColor3 = tokens.SubText,
-        })
-        TweenHelper.Tween(inputStroke, nil, { Color = tokens.Border })
-        if descLabel then
-            TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
-        end
+        Row.BackgroundColor3         = tokens.Surface
+        rowStroke.Color              = tokens.Border
+        titleLabel.TextColor3        = tokens.Text
+        InputBox.BackgroundColor3    = tokens.InputBackground
+        InputBox.TextColor3          = tokens.Text
+        InputBox.PlaceholderColor3   = tokens.SubText
+        inputStroke.Color            = tokens.Border
+        if descLabel then descLabel.TextColor3 = tokens.SubText end
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get(): string
-        return InputBox.Text
+        -- M6: return canonical _fullText, not the truncated display value
+        return _fullText
+    end
+
+    function api:GetDisplay(): string
+        return _fullText
     end
 
     function api:Set(text: string)
-        InputBox.Text = tostring(text)
-        OnChanged:Fire(InputBox.Text)
+        _fullText     = tostring(text)
+        InputBox.Text = _toDisplayText(_fullText)
+        OnChanged:Fire(_fullText)
     end
 
     function api:Enable()
@@ -5375,7 +6115,6 @@ function Toggle.New(parent: Instance, config: table)
         end
 
         OnChanged:Fire(state)
-        task.spawn(callback, state)
     end
 
     triggerBtn.MouseButton1Click:Connect(function()
@@ -5400,23 +6139,27 @@ function Toggle.New(parent: Instance, config: table)
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
-        TweenHelper.Tween(frame, nil, { BackgroundColor3 = tokens.Surface })
-        TweenHelper.Tween(stroke, nil, { Color = tokens.Border })
-        TweenHelper.Tween(titleLabel, nil, { TextColor3 = tokens.Text })
-        TweenHelper.Tween(track, nil, {
-            BackgroundColor3 = state and tokens.Accent or tokens.ToggleOff,
-        })
-        if descLabel then
-            TweenHelper.Tween(descLabel, nil, { TextColor3 = tokens.SubText })
-        end
+        frame.BackgroundColor3  = tokens.Surface
+        stroke.Color            = tokens.Border
+        titleLabel.TextColor3   = tokens.Text
+        track.BackgroundColor3  = state and tokens.Accent or tokens.ToggleOff
+        if descLabel then descLabel.TextColor3 = tokens.SubText end
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
-    local api = {}
+    local api = setmetatable({}, {
+        __tostring = function(self)
+            return self:GetDisplay()
+        end
+    })
 
     function api:Get(): boolean
         return state
+    end
+
+    function api:GetDisplay(): string
+        return state and "ON" or "OFF"
     end
 
     function api:Set(val: boolean)
@@ -5834,8 +6577,20 @@ local function _buildDialog(config: table)
     local dialogType = config.Type    or "Info"
     local title      = config.Title   or "Confirm"
     local message    = config.Message
-    local confirmCfg = config.Confirm or {}
-    local cancelCfg  = config.Cancel  -- nil = no cancel button
+    local confirmCfg = type(config.Confirm) == "table" and config.Confirm or {
+        Label    = type(config.Confirm) == "string" and config.Confirm or "Confirm",
+        Callback = config.OnConfirm or config.Callback,
+    }
+
+    local cancelCfg
+    if type(config.Cancel) == "table" then
+        cancelCfg = config.Cancel
+    elseif config.Cancel then
+        cancelCfg = {
+            Label    = type(config.Cancel) == "string" and config.Cancel or "Cancel",
+            Callback = config.OnCancel,
+        }
+    end
 
     local hasMessage = message and message ~= ""
     local hasCancel  = cancelCfg ~= nil
@@ -5869,14 +6624,14 @@ local function _buildDialog(config: table)
 
     -- ─── Card ─────────────────────────────────────────────────────────────────
 
-    local card = ComponentHelper.Create("Frame", {
+    local card = ComponentHelper.Create("CanvasGroup", {
         Name                   = "DialogCard",
         Size                   = UDim2.fromOffset(CARD_W, 0),
         AutomaticSize          = Enum.AutomaticSize.Y,
         AnchorPoint            = Vector2.new(0.5, 0.5),
         Position               = UDim2.fromScale(0.5, 0.5),
         BackgroundColor3       = ThemeEngine.GetToken("Surface"),
-        BackgroundTransparency = 1,   -- animated in
+        GroupTransparency      = 1,   -- animated in smoothly
         BorderSizePixel        = 0,
         ClipsDescendants       = false,
         ZIndex                 = 201,
@@ -6135,17 +6890,34 @@ function DialogService.Confirm(config: table)
     local handle, backdrop, card, cardStroke = _buildDialog(config)
     _activeDialog = handle
 
-    -- Animate backdrop in
+    -- Animate backdrop in immediately — it's a plain Frame with no AutomaticSize.
     AnimationEngine.Play(backdrop, TweenHelper.DefaultInfo,
         { BackgroundTransparency = BACKDROP_ALPHA }, "dlg_bg")
 
-    -- Animate card in: FadeIn + SlideIn from bottom (mild).
-    -- We avoid Pop() here because the card uses AutomaticSize.Y —
-    -- Pop() snaps Size before tweening and would fight AutomaticSize.
-    AnimationEngine.FadeIn(card, 1, TweenHelper.DefaultInfo)
-    AnimationEngine.SlideIn(card, "Bottom", 14, TweenHelper.SmoothInfo)
-    AnimationEngine.Play(cardStroke, TweenHelper.DefaultInfo,
-        { Transparency = 0 }, "fade")
+    -- M10 fix: defer card animations by one frame.
+    --
+    -- Root cause of first-show jump:
+    --   card uses AutomaticSize.Y. At this point in the call (same frame as
+    --   _buildDialog), the layout engine hasn't run yet — card.AbsoluteSize.Y = 0.
+    --   SlideIn reads card.Position from an element whose height is 0, starts the
+    --   tween, then the NEXT frame Roblox resolves AutomaticSize and the card height
+    --   snaps from 0 to its real value while the position tween is already playing.
+    --   That height snap is the visible jump.
+    --
+    -- task.defer yields past the current frame (costs ~1 render cycle, ≈ 16ms)
+    --   so AutomaticSize resolves before any animation reads card geometry.
+    --   The card starts invisible (BackgroundTransparency = 1 set in _buildDialog)
+    --   so there is no flash during the deferred frame.
+    task.defer(function()
+        -- Guard: dialog may have been dismissed before this frame ran.
+        if not backdrop or not backdrop.Parent then return end
+
+        -- Avoid Pop() — it snaps Size explicitly and fights AutomaticSize.Y.
+        AnimationEngine.FadeIn(card, 1, TweenHelper.DefaultInfo)
+        AnimationEngine.SlideIn(card, "Bottom", 14, TweenHelper.SmoothInfo)
+        AnimationEngine.Play(cardStroke, TweenHelper.DefaultInfo,
+            { Transparency = 0 }, "fade")
+    end)
 
     return handle
 end
@@ -6199,12 +6971,23 @@ local NOTIF_GAP       = 8        -- gap between toasts
 local MARGIN          = 14       -- margin from screen edge
 local ANIM_IN_OFFSET  = 24       -- pixels right-offset for slide-in
 
--- Compute safe notification width: max 300px but clamped to 80% of screen
--- width so notifications never overflow on narrow phones.
+-- Notification sizing — compact on mobile, full on desktop.
+-- On narrow phones (< 420px wide) use a slimmed-down 220px toast so the
+-- notification never covers more than ~56% of the screen and does not
+-- block the UI window underneath. Desktop keeps the original 300px cap.
 local function _notifWidth(): number
-    local cam    = workspace.CurrentCamera
-    local vp     = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    if vp.X < 420 then
+        return math.min(220, math.floor(vp.X * 0.56))
+    end
     return math.min(300, math.floor(vp.X * 0.80))
+end
+
+local function _isMobileViewport(): boolean
+    local cam = workspace.CurrentCamera
+    local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    return vp.X < 420
 end
 
 local NOTIF_WIDTH = _notifWidth()
@@ -6245,61 +7028,72 @@ function NotificationService.Init(screenGui: ScreenGui)
     local topInset   = math.max(topLeft.Y,    MARGIN)
     local rightInset = math.max(bottomRight.X, MARGIN)
 
-    -- On very narrow viewports (< 420px wide) switch to full-width centered
-    -- layout at the top of the screen. Avoids a tiny right-edge sliver that's
-    -- hard to read on small phones while still respecting the safe area.
-    local cam = workspace.CurrentCamera
-    local vp  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-    local isNarrow = vp.X < 420
-
-    if isNarrow then
-        -- Full-width, center-anchored, top of screen
-        _container = ComponentHelper.Create("Frame", {
-            Name            = "DeliriumNotifications",
-            AnchorPoint     = Vector2.new(0.5, 0),
-            Position        = UDim2.new(0.5, 0, 0, topInset),
-            Size            = UDim2.new(1, -(MARGIN * 2), 1, -(topInset + MARGIN)),
-            BackgroundTransparency = 1,
-            BorderSizePixel = 0,
-            ZIndex          = 100,
-            Parent          = screenGui,
-        })
-    else
-        _container = ComponentHelper.Create("Frame", {
-            Name            = "DeliriumNotifications",
-            AnchorPoint     = Vector2.new(1, 0),
-            Position        = UDim2.new(1, -rightInset, 0, topInset),
-            Size            = UDim2.new(0, NOTIF_WIDTH, 1, -(topInset + MARGIN)),
-            BackgroundTransparency = 1,
-            BorderSizePixel = 0,
-            ZIndex          = 100,
-            Parent          = screenGui,
-        })
-    end
-
-    ComponentHelper.Create("UIListLayout", {
-        SortOrder        = Enum.SortOrder.LayoutOrder,
-        VerticalAlignment = Enum.VerticalAlignment.Top,
-        Padding          = UDim.new(0, NOTIF_GAP),
-        Parent           = _container,
+    -- On narrow viewports (< 420px wide) use a compact right-anchored toast
+    -- at fixed 220px wide. Avoids the old full-width layout that blocked the
+    -- entire UI window on small phones. The right-anchor keeps it discoverable
+    -- without overlapping the SideNav on the left side of the Delirium window.
+    -- Desktop/tablet keeps the original right-anchored behaviour.
+    _container = ComponentHelper.Create("Frame", {
+        Name            = "DeliriumNotifications",
+        AnchorPoint     = Vector2.new(1, 0),
+        Position        = UDim2.new(1, -rightInset, 0, topInset),
+        Size            = UDim2.new(0, NOTIF_WIDTH, 1, -(topInset + MARGIN)),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex          = 100,
+        Parent          = screenGui,
     })
 end
 
 -- ─── Internal helpers ─────────────────────────────────────────────────────────
 
--- Re-assigns LayoutOrder to all visible toasts so the UIListLayout
--- respects insertion order consistently.
+local function _getRightInset(): number
+    local _, bottomRight = GuiService:GetGuiInset()
+    return math.max(bottomRight.X, MARGIN)
+end
+
+-- Calculate target Y offset for the toast at targetIndex in the visible stack
+local function _calculateTargetY(targetIndex: number): number
+    local y = 0
+    for i = 1, targetIndex - 1 do
+        local h = _visible[i]
+        if h and h._height then
+            y = y + h._height + NOTIF_GAP
+        end
+    end
+    return y
+end
+
+-- Restack all visible toasts smoothly by animating their Y position
 local function _restack()
     for i, h in ipairs(_visible) do
-        h._frame.LayoutOrder = i
+        if h._alive and h._frame and h._frame.Parent then
+            local targetY = _calculateTargetY(i)
+            local targetPos = UDim2.new(0, 0, 0, targetY)
+            AnimationEngine.Play(h._frame, ANIM_RESTACK, { Position = targetPos }, "restack")
+        end
     end
 end
 
--- Drain one item from the overflow queue into the visible stack (if room).
+-- Remove a handle from the overflow queue.
+local function _removeFromQueue(handle)
+    for i, h in ipairs(_queue) do
+        if h == handle then
+            table.remove(_queue, i)
+            break
+        end
+    end
+end
+
+-- Drain items from the overflow queue into the visible stack (if room).
 local function _drainQueue()
-    if #_visible >= MAX_VISIBLE then return end
-    local next = table.remove(_queue, 1)
-    if next then next:_show() end
+    while #_visible < MAX_VISIBLE and #_queue > 0 do
+        local nextHandle = table.remove(_queue, 1)
+        if nextHandle and nextHandle._alive then
+            nextHandle:_show()
+            break
+        end
+    end
 end
 
 -- Remove a handle from the visible list and restack.
@@ -6311,7 +7105,7 @@ local function _removeVisible(handle)
         end
     end
     _restack()
-    _drainQueue()
+    task.defer(_drainQueue)
 end
 
 -- ─── Notification handle constructor ─────────────────────────────────────────
@@ -6319,31 +7113,61 @@ end
 local function _buildHandle(config: table)
     local notifType  = config.Type     or "Info"
     local title      = config.Title    or "Notification"
-    local message    = config.Message  or ""
+    local rawMessage = config.Message  or ""
     local duration   = config.Duration  -- nil or 0 = persistent
     local action     = config.Action    -- optional {Label, Callback}
+
+    -- Flexible Message parsing: accepts string, number, Component object, or array table of parts.
+    -- Example: Message = {"Press ", KB1, " to unhide"} -> automatically becomes "Press K to unhide"
+    local message = ""
+    if type(rawMessage) == "table" then
+        local parts = {}
+        for _, part in ipairs(rawMessage) do
+            table.insert(parts, tostring(part))
+        end
+        message = table.concat(parts, "")
+    else
+        message = tostring(rawMessage)
+    end
+
     local hasMessage = message ~= ""
     local hasAction  = action ~= nil
+    local isMobile   = _isMobileViewport()
 
-    -- Height calculation
-    local baseH     = 52
-    if hasMessage then baseH += 22 end
-    if hasAction  then baseH += 34 end
+    -- Compact height on mobile to reduce visual footprint.
+    -- Mobile: tighter vertical rhythm (base 40px, +16px message, +28px action).
+    -- Desktop: original sizing (52 / +22 / +34).
+    local baseH, msgH, actH
+    if isMobile then
+        baseH = 40
+        msgH  = 16
+        actH  = 28
+    else
+        baseH = 52
+        msgH  = 22
+        actH  = 34
+    end
+    if hasMessage then baseH += msgH end
+    if hasAction  then baseH += actH end
+
+    local titleTextSize = isMobile and 11 or 13
+    local msgTextSize   = isMobile and 10 or 11
 
     local accentToken = TYPE_TOKEN[notifType] or "Accent"
 
     -- ─── Frame ──────────────────────────────────────────────────────────────
 
-    local frame = ComponentHelper.Create("Frame", {
-        Name             = "Notification_" .. notifType,
-        Size             = UDim2.new(1, 0, 0, baseH),
-        BackgroundColor3 = ThemeEngine.GetToken("Surface"),
-        BorderSizePixel  = 0,
-        ClipsDescendants = true,
-        -- Start off-screen to the right; _show() slides it in.
-        Position         = UDim2.new(0, NOTIF_WIDTH + ANIM_IN_OFFSET, 0, 0),
-        LayoutOrder      = 0,
-        Parent           = _container,
+    -- ─── Frame (CanvasGroup for smooth group fade & slide) ───────────────────
+
+    local frame = ComponentHelper.Create("CanvasGroup", {
+        Name              = "Notification_" .. notifType,
+        Size              = UDim2.new(0, NOTIF_WIDTH, 0, baseH),
+        BackgroundColor3  = ThemeEngine.GetToken("Surface"),
+        BorderSizePixel   = 0,
+        GroupTransparency = 1,
+        ClipsDescendants  = true,
+        Position          = UDim2.new(0, NOTIF_WIDTH + 40, 0, 0),
+        Parent            = _container,
     })
     ComponentHelper.AddCorner(frame, 8)
     ComponentHelper.AddStroke(frame, ThemeEngine.GetToken("Border"), 1)
@@ -6376,7 +7200,7 @@ local function _buildHandle(config: table)
         BackgroundTransparency = 1,
         Text               = title,
         TextColor3         = ThemeEngine.GetToken("Text"),
-        TextSize           = 13,
+        TextSize           = titleTextSize,
         Font               = Enum.Font.GothamBold,
         TextXAlignment     = Enum.TextXAlignment.Left,
         TextTruncate       = Enum.TextTruncate.AtEnd,
@@ -6389,12 +7213,12 @@ local function _buildHandle(config: table)
     if hasMessage then
         messageLabel = ComponentHelper.Create("TextLabel", {
             Name               = "Message",
-            Position           = UDim2.new(0, 0, 0, 20),
-            Size               = UDim2.new(1, 0, 0, 18),
+            Position           = UDim2.new(0, 0, 0, isMobile and 16 or 20),
+            Size               = UDim2.new(1, 0, 0, msgH),
             BackgroundTransparency = 1,
             Text               = message,
             TextColor3         = ThemeEngine.GetToken("SubText"),
-            TextSize           = 11,
+            TextSize           = msgTextSize,
             Font               = Enum.Font.Gotham,
             TextXAlignment     = Enum.TextXAlignment.Left,
             TextTruncate       = Enum.TextTruncate.AtEnd,
@@ -6483,27 +7307,41 @@ local function _buildHandle(config: table)
     -- ─── Handle object ──────────────────────────────────────────────────────
 
     local handle = {}
-    handle._frame   = frame
-    handle._alive   = true
-    local _timer    = nil
+    handle._frame  = frame
+    handle._height = baseH
+    handle._alive  = true
+    local _timer   = nil
 
     function handle:_show()
+        if not self._alive then return end
         table.insert(_visible, self)
-        _restack()
 
-        -- Slide in from the right.
-        frame.Position = UDim2.new(0, NOTIF_WIDTH + ANIM_IN_OFFSET, 0, 0)
-        AnimationEngine.Play(frame, ANIM_SLIDE_INFO,
-            {Position = UDim2.fromScale(0, 0)}, "slide")
+        local targetIndex = #_visible
+        local targetY = _calculateTargetY(targetIndex)
+
+        -- Initial position off-screen right
+        frame.Position = UDim2.new(0, NOTIF_WIDTH + 40, 0, targetY)
+        frame.GroupTransparency = 1
+
+        -- Slide in smoothly to target position + fade in GroupTransparency
+        AnimationEngine.Play(frame, ANIM_SLIDE_INFO, {
+            Position          = UDim2.new(0, 0, 0, targetY),
+            GroupTransparency = 0,
+        }, "slide")
+
+        _restack()
 
         -- Start timeout timer if duration is set.
         if duration and duration > 0 then
             local timerInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
-            local t = TweenService:Create(progressFill, timerInfo, {Size = UDim2.fromScale(0, 1)})
+            local t = TweenService:Create(progressFill, timerInfo, {Size = UDim2.new(0, 0, 1, 0)})
             t:Play()
+
             _timer = task.delay(duration, function()
-                _timer = nil  -- clear before Dismiss; can't cancel the running thread
-                if self._alive then self:Dismiss() end
+                _timer = nil
+                if self._alive then
+                    self:Dismiss()
+                end
             end)
         end
     end
@@ -6511,21 +7349,43 @@ local function _buildHandle(config: table)
     function handle:Dismiss()
         if not self._alive then return end
         self._alive = false
-        if _timer then task.cancel(_timer) end
+        if _timer then
+            pcall(task.cancel, _timer)
+            _timer = nil
+        end
         themeDisconnect()
+        _removeFromQueue(self)
 
-        -- Slide out to the right, then destroy.
-        local t = AnimationEngine.Play(frame, ANIM_OUT_INFO,
-            {Position = UDim2.new(0, NOTIF_WIDTH + ANIM_IN_OFFSET, 0, 0)}, "slide")
-        if t then
-            t.Completed:Connect(function()
-                frame:Destroy()
-            end)
-        else
-            frame:Destroy()
+        local _finished = false
+        local function _finish()
+            if _finished then return end
+            _finished = true
+            _removeVisible(self)
+            if type(config.OnComplete) == "function" then
+                pcall(config.OnComplete)
+            end
+            pcall(function() frame:Destroy() end)
         end
 
-        _removeVisible(self)
+        if not frame or not frame.Parent then
+            _finish()
+            return
+        end
+
+        -- Slide out smoothly to the right + GroupTransparency fade out
+        local currentY = frame.Position.Y.Offset
+        local t = AnimationEngine.Play(frame, ANIM_OUT_INFO, {
+            Position          = UDim2.new(0, NOTIF_WIDTH + 40, 0, currentY),
+            GroupTransparency = 1,
+        }, "slide")
+
+        if t then
+            t.Completed:Connect(_finish)
+            -- Fallback: ensure _finish always fires even if tween is cancelled/destroyed
+            task.delay(ANIM_OUT_INFO.Time + 0.05, _finish)
+        else
+            _finish()
+        end
     end
 
     -- Runtime update helpers.
@@ -6541,6 +7401,8 @@ local function _buildHandle(config: table)
     closeBtn.MouseButton1Click:Connect(function()
         handle:Dismiss()
     end)
+
+    handle.Destroy = handle.Dismiss
 
     return handle
 end
@@ -6565,26 +7427,34 @@ function NotificationService.Push(config: table)
     return handle
 end
 
--- Dismiss every active notification immediately.
-function NotificationService.DismissAll()
-    -- Copy the list since Dismiss modifies _visible.
+-- Dismiss every active notification. If instant=true, destroys frames immediately without slide animation.
+function NotificationService.DismissAll(instant: boolean?)
+    table.clear(_queue)
     local snapshot = {table.unpack(_visible)}
+    table.clear(_visible)
     for _, h in ipairs(snapshot) do
-        h:Dismiss()
+        pcall(function()
+            if instant then
+                h._alive = false
+                if h._frame and h._frame.Parent then
+                    h._frame:Destroy()
+                end
+            else
+                h:Dismiss()
+            end
+        end)
     end
-    _queue = {}
 end
 
 -- Full reset — called by Bootstrap before creating a new session.
 -- Clears all module-level state so Init() can be safely called again.
 function NotificationService.Reset()
+    table.clear(_queue)
     local snapshot = {table.unpack(_visible)}
+    table.clear(_visible)
     for _, h in ipairs(snapshot) do
         pcall(function() h:Dismiss() end)
     end
-    table.clear(_visible)
-    table.clear(_queue)
-    -- _container belongs to the old ScreenGui; Bootstrap destroys that separately
     _container   = nil
     _initialized = false
 end
@@ -6599,6 +7469,105 @@ ServiceRegistry.Register("NotificationService", {
 }, 50)  -- priority 50 — inits after ThemeEngine (10) since it reads theme tokens
 
 return NotificationService
+
+end
+
+-- ── Services.UnloadService ────────────────────────────────
+_Delirium_modules["Services.UnloadService"] = function()
+-- Services/UnloadService.lua
+-- Centralized lifecycle & unload management service for Delirium.
+-- Follows BASE.md philosophy: clean, lightweight, predictable, and leak-free.
+-- local Root = script.Parent.Parent
+local Maid = _Delirium_require("Core.Maid")
+local ServiceRegistry = _Delirium_require("Core.ServiceRegistry")
+local AnimationEngine = _Delirium_require("Core.AnimationEngine")
+local NotificationService = _Delirium_require("Services.NotificationService")
+
+local UnloadService = {}
+
+local _maid       = Maid.new()
+local _unloading  = false
+local _runtimeRef = nil
+
+function UnloadService.Init(_, runtime)
+    _runtimeRef = runtime
+    _unloading  = false
+end
+
+function UnloadService.Reset()
+    pcall(function() _maid:DoCleaning() end)
+    _maid       = Maid.new()
+    _unloading  = false
+    _runtimeRef = nil
+end
+
+function UnloadService.Register(task)
+    return _maid:GiveTask(task)
+end
+UnloadService.GiveTask = UnloadService.Register
+
+function UnloadService.IsUnloading(): boolean
+    return _unloading
+end
+
+function UnloadService.Unload(config: table?)
+    if _unloading then return end
+    _unloading = true
+
+    config = config or {}
+    local duration = config.Duration or 2.0
+    local silent   = config.Silent == true
+
+    -- 1. Smoothly animate active windows closing (CanvasGroup GroupTransparency fade + slide down)
+    if _runtimeRef and _runtimeRef._windows then
+        local snapshot = {table.unpack(_runtimeRef._windows)}
+        for _, win in ipairs(snapshot) do
+            pcall(function()
+                if win.MainFrame and win.MainFrame.Parent then
+                    AnimationEngine.CloseWindow(win.MainFrame, function()
+                        if win.Destroy then win:Destroy() end
+                    end)
+                end
+                if win._miniIconFrame and win._miniIconFrame.Parent then
+                    win._miniIconFrame.Visible = false
+                end
+            end)
+        end
+    end
+
+    -- 2. Instantly clear all pre-existing notifications
+    NotificationService.DismissAll(true)
+
+    local function _executeTeardown()
+        pcall(function() _maid:DoCleaning() end)
+        pcall(function() NotificationService.Reset() end)
+        if _runtimeRef then
+            pcall(function() _runtimeRef:Destroy() end)
+            _runtimeRef = nil
+        end
+        _G["__DeliriumRuntime"] = nil
+    end
+
+    if silent then
+        _executeTeardown()
+        return
+    end
+
+    -- 3. Show sleek Unload Progress Toast
+    return NotificationService.Push({
+        Title      = "Unloading Delirium",
+        Message    = "Disconnecting signals, keybinds, and UI...",
+        Type       = "Warning",
+        Duration   = duration,
+        OnComplete = _executeTeardown,
+    })
+end
+
+ServiceRegistry.Register("UnloadService", {
+    Reset = UnloadService.Reset,
+}, 10)
+
+return UnloadService
 
 end
 
@@ -6625,6 +7594,7 @@ local ThemeEngine         = _Delirium_require("Core.ThemeEngine")
 local AnimationEngine     = _Delirium_require("Core.AnimationEngine")
 local NotificationService = _Delirium_require("Services.NotificationService")
 local DialogService       = _Delirium_require("Services.DialogService")
+local UnloadService       = _Delirium_require("Services.UnloadService")
 local Window              = _Delirium_require("Layout.Window")
 
 -- ─── Constants ─────────────────────────────────────────────────────────────
@@ -6655,8 +7625,20 @@ local function _createGui(): ScreenGui
     local gui = Instance.new("ScreenGui")
     gui.Name            = GUI_NAME
     gui.ResetOnSpawn    = false
+    -- Sibling ZIndexBehavior: ZIndex values are scoped relative to parent containers.
+    -- Prevents deep-nested elements of Window 1 from bleeding over Window 2's background.
     gui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
     gui.IgnoreGuiInset  = true   -- cover full screen incl. topbar area; avoids backdrop gap
+    -- DisplayOrder = 100: renders Delirium above all standard game GUI layers
+    -- (game typically uses 0–9). This is the root fix for two mobile bugs:
+    --   1. Click-through — game buttons behind the window fire because game ScreenGui
+    --      had higher display priority. With DisplayOrder=100 Delirium receives input
+    --      first; its InputSink TextButton absorbs all empty-area touches.
+    --   2. Camera rotation during title-bar drag — Roblox's CameraController reads
+    --      touch events from UserInputService and marks them non-processed unless a
+    --      higher-priority ScreenGui consumed them first. DragZone (TextButton) now
+    --      sits above the game player GUI that the camera script reads through.
+    pcall(function() gui.DisplayOrder = 100 end)
     local ok = pcall(function() gui.Parent = CoreGui end)
     if not ok then
         local lp = Players.LocalPlayer
@@ -6682,8 +7664,9 @@ local function Bootstrap()
     _nukeExistingGui()
 
     -- Step 2: Destroy previous Runtime (handles cascade + service cleanup)
-    local existing = _G[RUNTIME_KEY]
-    if existing then
+    local envG = (type(getgenv) == "function" and getgenv()) or _G or {}
+    local existing = envG[RUNTIME_KEY]
+    if existing and type(existing) == "table" then
         if type(existing.IsAlive) == "function" and existing:IsAlive() then
             pcall(function() existing:Destroy() end)
             task.wait()  -- one frame for async resources to settle
@@ -6691,7 +7674,7 @@ local function Bootstrap()
             -- Dead/stale: just reset services
             ServiceRegistry.ResetAll()
         end
-        _G[RUNTIME_KEY] = nil
+        envG[RUNTIME_KEY] = nil
     end
 
     -- Step 3: Hard reset all services regardless of path above
@@ -6704,10 +7687,12 @@ local function Bootstrap()
     -- Runtime owns the ScreenGui instance
     runtime:OwnResource(gui)
 
-    _G[RUNTIME_KEY] = runtime
+    pcall(function() envG[RUNTIME_KEY] = runtime end)
+    if type(_G) == "table" then pcall(function() _G[RUNTIME_KEY] = runtime end) end
     _runtime        = runtime
 
-    -- Step 5: Initialize services with the new ScreenGui
+    -- Step 5: Initialize UnloadService and all services with ScreenGui & Runtime
+    UnloadService.Init(gui, runtime)
     ServiceRegistry.InitAll(gui)
 
     return runtime, gui
@@ -6758,9 +7743,28 @@ function Delirium:IsSessionCurrent(sessionId: string): boolean
     return _runtime:IsCurrent(sessionId)
 end
 
+-- Full Unload Handler (delegates to dedicated UnloadService)
+function Delirium:Unload(config: table?)
+    return UnloadService.Unload(config)
+end
+
+-- Register custom cleanup tasks/functions to be executed when Delirium unloads
+function Delirium:OnUnload(task)
+    return UnloadService.Register(task)
+end
+
 -- Expose sub-modules for advanced use
 Delirium.Theme     = ThemeEngine
 Delirium.Animation = AnimationEngine
 Delirium.Dialog    = DialogService
+Delirium.UnloadSvc = UnloadService
+
+_runtime.PublicApi = Delirium
+if type(shared) == "table" then pcall(function() shared.Delirium = Delirium end) end
+if type(_G) == "table" then pcall(function() _G.Delirium = Delirium end) end
+if type(getgenv) == "function" then
+    local env = getgenv()
+    if type(env) == "table" then env.Delirium = Delirium end
+end
 
 return Delirium
