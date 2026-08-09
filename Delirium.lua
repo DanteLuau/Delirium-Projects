@@ -1,4 +1,4 @@
--- Delirium v1.1.0
+-- Delirium v1.0.0
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -7657,6 +7657,12 @@ function UnloadService.Unload(config: table?)
         if envG["__DeliriumRuntime"] == targetRuntime then
             envG["__DeliriumRuntime"] = nil
         end
+        if envG.Delirium and type(envG.Delirium) == "table" and targetRuntime and not targetRuntime:IsAlive() then
+            envG.Delirium = nil
+        end
+        if type(shared) == "table" and shared.Delirium and type(shared.Delirium) == "table" and targetRuntime and not targetRuntime:IsAlive() then
+            shared.Delirium = nil
+        end
     end
 
     if silent then
@@ -7814,14 +7820,18 @@ local _runtime, _gui = Bootstrap()
 
 -- ─── Delirium Public API ───────────────────────────────────────────────────
 
-local Delirium = {
-    Version = "1.1.0",
-}
+local function _ensureActiveRuntime()
+    if not _runtime or not _runtime:IsAlive() then
+        _runtime, _gui = Bootstrap()
+    end
+end
 
 function Delirium:CreateWindow(config: table)
     assert(config and type(config) == "table",
         "Delirium:CreateWindow expects a configuration table")
     config.Name = config.Name or config.Title or "Delirium"
+
+    _ensureActiveRuntime()
 
     local win = Window.new(config, _gui)
     _runtime:RegisterWindow(win)
@@ -7829,6 +7839,7 @@ function Delirium:CreateWindow(config: table)
 end
 
 function Delirium:Notify(config: table)
+    _ensureActiveRuntime()
     return NotificationService.Push(config)
 end
 
