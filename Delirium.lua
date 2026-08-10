@@ -1,4 +1,4 @@
--- Delirium v1.0.0
+-- Delirium v1.1.0
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -253,7 +253,12 @@ function ComponentHelper.BindCallback(api: table, config: table?)
         for _, sig in ipairs(signals) do
             if sig and type(sig.Connect) == "function" then
                 sig:Connect(function(...)
-                    task.spawn(callback, ...)
+                    -- Direct pcall (no task.spawn) so callback fires synchronously
+                    -- within the signal dispatch frame. Avoids double-async delay where
+                    -- Signal:Fire already task.spawns the handler: adding another
+                    -- task.spawn pushes the callback 2+ frames out, causing timing
+                    -- failures in tests that assert immediately after Set().
+                    pcall(callback, ...)
                 end)
             end
         end
@@ -285,6 +290,9 @@ function Signal:Connect(fn: (...any) -> ())
     return {
         Disconnect = function()
             handler.connected = false
+            -- Guard: signal may have been Destroy()d already (_handlers = nil).
+            -- table.find(nil, ...) would error without this check.
+            if not self._handlers then return end
             local index = table.find(self._handlers, handler)
             if index then
                 table.remove(self._handlers, index)
@@ -331,6 +339,7 @@ function Signal:DisconnectAll()
 end
 
 function Signal:Destroy()
+    if not self._handlers then return end
     table.clear(self._handlers)
     self._handlers = nil
 end
@@ -7694,7 +7703,7 @@ end
 --
 -- Bootstrap flow (per exec):
 --   Detect previous Runtime in _G
---     ├── Alive  → Runtime:Destroy() → wait frame → create new
+--     ├── Alive  → Runtime:Destroy() → create new
 --     └── Dead   → wipe stale state  → create new
 --   (none) → scan for orphan GUI → create new
 --
@@ -7718,6 +7727,16 @@ local Window              = _Delirium_require("Layout.Window")
 
 local RUNTIME_KEY = "__DeliriumRuntime"
 local GUI_NAME    = "DeliriumUI"
+
+-- ─── Public API Declaration ────────────────────────────────────────────────
+-- Declared at file top-level so Delirium is never nil during execution
+
+local Delirium = { Version = "1.1.0" }
+
+-- ─── State ─────────────────────────────────────────────────────────────────
+
+local _runtime: typeof(Runtime.new()) = nil
+local _gui: ScreenGui = nil
 
 -- ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -7743,18 +7762,8 @@ local function _createGui(): ScreenGui
     gui.Name            = GUI_NAME
     gui.ResetOnSpawn    = false
     -- Sibling ZIndexBehavior: ZIndex values are scoped relative to parent containers.
-    -- Prevents deep-nested elements of Window 1 from bleeding over Window 2's background.
     gui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
-    gui.IgnoreGuiInset  = true   -- cover full screen incl. topbar area; avoids backdrop gap
-    -- DisplayOrder = 100: renders Delirium above all standard game GUI layers
-    -- (game typically uses 0–9). This is the root fix for two mobile bugs:
-    --   1. Click-through — game buttons behind the window fire because game ScreenGui
-    --      had higher display priority. With DisplayOrder=100 Delirium receives input
-    --      first; its InputSink TextButton absorbs all empty-area touches.
-    --   2. Camera rotation during title-bar drag — Roblox's CameraController reads
-    --      touch events from UserInputService and marks them non-processed unless a
-    --      higher-priority ScreenGui consumed them first. DragZone (TextButton) now
-    --      sits above the game player GUI that the camera script reads through.
+    gui.IgnoreGuiInset  = true
     pcall(function() gui.DisplayOrder = 100 end)
     local ok = pcall(function() gui.Parent = CoreGui end)
     if not ok then
@@ -7774,8 +7783,6 @@ end
 
 -- ─── Bootstrap ─────────────────────────────────────────────────────────────
 
-local _runtime: typeof(Runtime.new()) = nil
-
 local function Bootstrap()
     -- Step 1: Destroy GUI unconditionally — most reliable kill
     _nukeExistingGui()
@@ -7786,7 +7793,6 @@ local function Bootstrap()
     if existing and type(existing) == "table" then
         if type(existing.IsAlive) == "function" and existing:IsAlive() then
             pcall(function() existing:Destroy() end)
-            task.wait()  -- one frame for async resources to settle
         else
             -- Dead/stale: just reset services
             ServiceRegistry.ResetAll()
@@ -7806,25 +7812,28 @@ local function Bootstrap()
 
     pcall(function() envG[RUNTIME_KEY] = runtime end)
     if type(_G) == "table" then pcall(function() _G[RUNTIME_KEY] = runtime end) end
-    _runtime        = runtime
+    _runtime = runtime
+    _gui     = gui
 
     -- Step 5: Initialize UnloadService and all services with ScreenGui & Runtime
     UnloadService.Init(gui, runtime)
     ServiceRegistry.InitAll(gui)
 
+    runtime.PublicApi = Delirium
+
     return runtime, gui
 end
 
--- Run immediately on require
-local _runtime, _gui = Bootstrap()
-
--- ─── Delirium Public API ───────────────────────────────────────────────────
+-- Run immediately on require (assigns upvalues directly, no local shadowing)
+_runtime, _gui = Bootstrap()
 
 local function _ensureActiveRuntime()
     if not _runtime or not _runtime:IsAlive() then
         _runtime, _gui = Bootstrap()
     end
 end
+
+-- ─── Delirium Public API Methods ───────────────────────────────────────────
 
 function Delirium:CreateWindow(config: table)
     assert(config and type(config) == "table",
@@ -7856,13 +7865,12 @@ function Delirium:SetReducedMotion(enabled: boolean)
 end
 
 -- Returns the session ID of the current runtime.
--- Capture this before async work; check IsCurrent() after to guard stale callbacks.
 function Delirium:GetSessionId(): string
-    return _runtime.SessionId
+    return _runtime and _runtime.SessionId or ""
 end
 
 function Delirium:IsSessionCurrent(sessionId: string): boolean
-    return _runtime:IsCurrent(sessionId)
+    return _runtime and _runtime:IsCurrent(sessionId) or false
 end
 
 -- Full Unload Handler (delegates to dedicated UnloadService)
@@ -7881,7 +7889,6 @@ Delirium.Animation = AnimationEngine
 Delirium.Dialog    = DialogService
 Delirium.UnloadSvc = UnloadService
 
-_runtime.PublicApi = Delirium
 if type(shared) == "table" then pcall(function() shared.Delirium = Delirium end) end
 if type(_G) == "table" then pcall(function() _G.Delirium = Delirium end) end
 if type(getgenv) == "function" then
