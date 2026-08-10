@@ -3327,7 +3327,7 @@ function Button.New(parent: Instance, config: table)
         Name               = "Title",
         Size               = UDim2.new(1, -30, hasDesc and 0.5 or 1, 0),
         BackgroundTransparency = 1,
-        Text               = config.Title or "Button",
+        Text               = config.Title or config.Name or config.Text or "Button",
         TextColor3         = ThemeEngine.GetToken("Text"),
         TextSize           = 14,
         Font               = Enum.Font.GothamMedium,
@@ -3630,7 +3630,7 @@ local HUE_DOMINANCE      = 1.5  -- dy must exceed dx by this factor for hue stri
 
 function ColorPicker.New(parent: Instance, config: table)
     config = config or {}
-    local title        = config.Title       or "Color"
+    local title        = config.Title or config.Name or config.Text or "Color"
     local desc         = config.Description or ""
     local currentColor = config.Default     or Color3.fromRGB(100, 80, 240)
     local enabled      = true
@@ -4212,7 +4212,7 @@ local Dropdown = {}
 
 function Dropdown.New(parent: Instance, config: table)
     config = config or {}
-    local title   = config.Title       or "Dropdown"
+    local title   = config.Title or config.Name or config.Text or "Dropdown"
     local desc    = config.Description or ""
     local options = config.Options     or {}
     local isMulti = config.Multi       == true
@@ -4625,7 +4625,7 @@ local Keybind = {}
 
 function Keybind.New(parent: Instance, config: table)
     config = config or {}
-    local title      = config.Title       or "Keybind"
+    local title      = config.Title or config.Name or config.Text or "Keybind"
     local desc       = config.Description or ""
     local currentKey = config.Default     or Enum.KeyCode.E
     local enabled    = true
@@ -4919,7 +4919,7 @@ local Label = {}
 function Label.New(parent: Instance, config: table)
     config = config or {}
 
-    local title    = config.Title   or ""
+    local title    = config.Title or config.Name or config.Text or ""
     local value    = config.Value   or ""
     local variant  = config.Variant or "default"
     local valueToken = VARIANT_TOKEN[variant] or "SubText"
@@ -5044,7 +5044,7 @@ local Paragraph = {}
 function Paragraph.New(parent: Instance, config: table)
     config = config or {}
 
-    local title    = config.Title   or ""
+    local title    = config.Title or config.Name or ""
     local content  = config.Content or config.Text or ""
     local hasTitle = title ~= ""
 
@@ -5264,7 +5264,7 @@ function Slider.New(parent: Instance, config: table)
         Name               = "Title",
         Size               = UDim2.new(1, -60, 0, 18),
         BackgroundTransparency = 1,
-        Text               = config.Title or "Slider",
+        Text               = config.Title or config.Name or config.Text or "Slider",
         TextColor3         = ThemeEngine.GetToken("Text"),
         TextSize           = 14,
         Font               = Enum.Font.GothamMedium,
@@ -5543,7 +5543,7 @@ local TextBox = {}
 
 function TextBox.New(parent: Instance, config: table)
     config = config or {}
-    local title       = config.Title        or "Input"
+    local title       = config.Title or config.Name or config.Text or "Input"
     local desc        = config.Description  or ""
     local placeholder = config.Placeholder  or "Type here..."
     local defaultText = config.Default      or ""
@@ -6057,7 +6057,7 @@ function Toggle.New(parent: Instance, config: table)
         Name               = "Title",
         Size               = UDim2.new(1, -52, hasDesc and 0.5 or 1, 0),
         BackgroundTransparency = 1,
-        Text               = config.Title or "Toggle",
+        Text               = config.Title or config.Name or config.Text or "Toggle",
         TextColor3         = ThemeEngine.GetToken("Text"),
         TextSize           = 14,
         Font               = Enum.Font.GothamMedium,
