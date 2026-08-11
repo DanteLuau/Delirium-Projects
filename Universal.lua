@@ -1464,7 +1464,7 @@ quickSection:CreateButton({
     Description = "Copy server Job ID to clipboard",
     Callback    = function()
         ServerModule:CopyJobId()
-        Delirium.Notify({ Title="Copied", Message="Job ID copied to clipboard", Duration=2 })
+        Delirium:Notify({ Title="Copied", Message="Job ID copied to clipboard", Duration=2 })
     end,
 })
 quickSection:CreateButton({
@@ -1472,7 +1472,7 @@ quickSection:CreateButton({
     Description = "Copy Place ID to clipboard",
     Callback    = function()
         ServerModule:CopyPlaceId()
-        Delirium.Notify({ Title="Copied", Message="Place ID copied to clipboard", Duration=2 })
+        Delirium:Notify({ Title="Copied", Message="Place ID copied to clipboard", Duration=2 })
     end,
 })
 quickSection:CreateButton({
@@ -1577,7 +1577,7 @@ infoSection:CreateButton({
     Description = "Copy username to clipboard",
     Callback    = function()
         copyToClipboard(LP.Name)
-        Delirium.Notify({ Title="Copied", Message=LP.Name, Duration=2 })
+        Delirium:Notify({ Title="Copied", Message=LP.Name, Duration=2 })
     end,
 })
 infoSection:CreateButton({
@@ -1585,7 +1585,7 @@ infoSection:CreateButton({
     Description = "Copy User ID to clipboard",
     Callback    = function()
         copyToClipboard(tostring(LP.UserId))
-        Delirium.Notify({ Title="Copied", Message=tostring(LP.UserId), Duration=2 })
+        Delirium:Notify({ Title="Copied", Message=tostring(LP.UserId), Duration=2 })
     end,
 })
 
@@ -1628,12 +1628,12 @@ selectedInfoSection:CreateButton({
     Callback    = function()
         local sel = PlayerModule.SelectedPlayer
         if not sel then
-            Delirium.Notify({Title="No Player", Message="Select a player first", Duration=2})
+            Delirium:Notify({Title="No Player", Message="Select a player first", Duration=2})
             return
         end
         local info = PlayerModule:GetPlayerInfo(sel)
         local msg = info.Distance >= 0 and (info.Distance.." studs") or "Unavailable"
-        Delirium.Notify({Title=sel.Name, Message="Distance: "..msg, Duration=3})
+        Delirium:Notify({Title=sel.Name, Message="Distance: "..msg, Duration=3})
     end,
 })
 selectedInfoSection:CreateButton({
@@ -1643,7 +1643,7 @@ selectedInfoSection:CreateButton({
         local sel = PlayerModule.SelectedPlayer
         if sel then
             copyToClipboard(sel.Name)
-            Delirium.Notify({Title="Copied", Message=sel.Name, Duration=2})
+            Delirium:Notify({Title="Copied", Message=sel.Name, Duration=2})
         end
     end,
 })
@@ -1654,7 +1654,7 @@ selectedInfoSection:CreateButton({
         local sel = PlayerModule.SelectedPlayer
         if sel then
             copyToClipboard(tostring(sel.UserId))
-            Delirium.Notify({Title="Copied", Message=tostring(sel.UserId), Duration=2})
+            Delirium:Notify({Title="Copied", Message=tostring(sel.UserId), Duration=2})
         end
     end,
 })
@@ -1750,7 +1750,7 @@ fxSection:CreateButton({
     Callback    = function()
         VisualModule:_restore()
         VisualModule:_backup()
-        Delirium.Notify({Title="Visual",Message="Defaults restored",Duration=2})
+        Delirium:Notify({Title="Visual",Message="Defaults restored",Duration=2})
     end,
 })
 
@@ -1802,7 +1802,7 @@ optimSection:CreateDropdown({
     Default = "BALANCED",
     Callback= function(v)
         OptimModule:ApplyProfile(v)
-        Delirium.Notify({Title="Optimizer",Message="Profile: "..v,Duration=2})
+        Delirium:Notify({Title="Optimizer",Message="Profile: "..v,Duration=2})
     end,
 })
 optimSection:CreateToggle({
@@ -1819,7 +1819,7 @@ optimSection:CreateButton({
     Callback    = function()
         OptimModule:Disable()
         OptimModule._applied = false
-        Delirium.Notify({Title="Optimizer",Message="Restored",Duration=2})
+        Delirium:Notify({Title="Optimizer",Message="Restored",Duration=2})
     end,
 })
 
@@ -1842,7 +1842,7 @@ serverInfoSection:CreateButton({
     Description = "Copy full Job ID",
     Callback    = function()
         ServerModule:CopyJobId()
-        Delirium.Notify({Title="Copied",Message="Job ID copied",Duration=2})
+        Delirium:Notify({Title="Copied",Message="Job ID copied",Duration=2})
     end,
 })
 serverInfoSection:CreateButton({
@@ -1850,7 +1850,7 @@ serverInfoSection:CreateButton({
     Description = "Copy Place ID",
     Callback    = function()
         ServerModule:CopyPlaceId()
-        Delirium.Notify({Title="Copied",Message="Place ID copied",Duration=2})
+        Delirium:Notify({Title="Copied",Message="Place ID copied",Duration=2})
     end,
 })
 serverInfoSection:CreateButton({
@@ -1882,7 +1882,7 @@ searchSection:CreateButton({
             query = searchBox:Get()
         end
         if query == "" then
-            Delirium.Notify({Title="Explorer",Message="Enter a search query",Duration=2})
+            Delirium:Notify({Title="Explorer",Message="Enter a search query",Duration=2})
             return
         end
         local results = ExplorerModule:Search(query, game, 50)
@@ -1898,7 +1898,7 @@ searchSection:CreateButton({
                 end
                 table.insert(lines, r.ClassName..": "..r.Name.." ("..r.Children.." children)")
             end
-            Delirium.Notify({
+            Delirium:Notify({
                 Title   = "Explorer Results",
                 Message = table.concat(lines,"\n"):sub(1,200),
                 Duration= 5,
@@ -1913,9 +1913,9 @@ searchSection:CreateButton({
         if #ExplorerModule._results > 0 then
             local r = ExplorerModule._results[1]
             copyToClipboard(r.Path)
-            Delirium.Notify({Title="Copied",Message=r.Path,Duration=3})
+            Delirium:Notify({Title="Copied",Message=r.Path,Duration=3})
         else
-            Delirium.Notify({Title="No Results",Message="Run a search first",Duration=2})
+            Delirium:Notify({Title="No Results",Message="Run a search first",Duration=2})
         end
     end,
 })
@@ -2023,7 +2023,7 @@ consoleSection:CreateButton({
         local lines = {}
         for _,e in ipairs(entries) do table.insert(lines, Logger.Format(e)) end
         copyToClipboard(table.concat(lines,"\n"))
-        Delirium.Notify({Title="Diagnostics",Message="Logs copied",Duration=2})
+        Delirium:Notify({Title="Diagnostics",Message="Logs copied",Duration=2})
     end,
 })
 
@@ -2111,7 +2111,7 @@ configSection:CreateButton({
     Description = "Copy current config as JSON to clipboard",
     Callback    = function()
         ConfigModule:Export()
-        Delirium.Notify({Title="Config",Message="Exported to clipboard",Duration=3})
+        Delirium:Notify({Title="Config",Message="Exported to clipboard",Duration=3})
     end,
 })
 configSection:CreateTextbox({
@@ -2121,7 +2121,7 @@ configSection:CreateTextbox({
     Callback    = function(v)
         if v and #v > 2 then
             local ok = ConfigModule:Import(v)
-            Delirium.Notify({
+            Delirium:Notify({
                 Title   = "Config",
                 Message = ok and "Imported successfully" or "Import failed — invalid JSON",
                 Duration= 3,
@@ -2134,7 +2134,7 @@ configSection:CreateButton({
     Description = "Restore all configuration defaults",
     Callback    = function()
         ConfigModule:Reset()
-        Delirium.Notify({Title="Config",Message="Reset to defaults",Duration=2})
+        Delirium:Notify({Title="Config",Message="Reset to defaults",Duration=2})
     end,
 })
 
@@ -2148,7 +2148,7 @@ moduleManageSection:CreateButton({
                 Registry.Disable(name)
             end
         end
-        Delirium.Notify({Title="Universal",Message="All modules disabled",Duration=3})
+        Delirium:Notify({Title="Universal",Message="All modules disabled",Duration=3})
     end,
 })
 
