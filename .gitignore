@@ -1,0 +1,31 @@
+# Logs
+*.log
+logs/
+test-results/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Local / private files
+.env
+.env.*
+executor/
+private/
+local/
+
+# Python
+__pycache__/
+*.pyc
