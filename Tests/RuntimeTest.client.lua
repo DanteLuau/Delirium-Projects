@@ -2,16 +2,10 @@
 -- Delirium v1.1.0 — Runtime Stress Test Suite
 --
 -- Execution model:
---   Delirium is a single bundled file (Delirium.lua) loaded via an EXECUTOR
---   (loadstring + readfile / game:HttpGet). It is NOT a DataModel ModuleScript
---   tree, so script.Parent.Parent was never a valid Delirium root.
---
---   Placed at <DeliriumRoot>/Tests/RuntimeTest.client.lua, the harness:
---     1. Detects the environment (Executor vs Roblox Studio).
---     2. In an executor: loads Delirium.lua from a local path (readfile) or
---        falls back to the raw GitHub URL (mirrors Script-Hub/Universal.lua).
---     3. In Roblox Studio: prints SKIP — the production bundle requires
---        executor-only APIs and cannot execute in Studio.
+--   Delirium is a single bundled file fetched ONLY from the raw GitHub dist URL
+--   via the executor's game:HttpGet() + loadstring(). The harness is fully
+--   independent of where RuntimeTest.client.lua is located — no local files,
+--   no DataModel paths, no workspace paths.
 --
 -- Loaded runtime:
 --   All tests run against the SAME bundled Delirium instance returned by the
@@ -38,83 +32,68 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- ── Environment detection ─────────────────────────────────────────────────────
--- Delirium is a single bundled file (Delirium.lua) intended for EXECUTOR loading
--- via loadstring. It is NOT a DataModel ModuleScript tree, so
--- require(script.Parent.Parent) is invalid. We detect the environment and load
--- the bundle directly.
-
 local IS_EXECUTOR = (type(getgenv) == "function")
-local IS_STUDIO   = not IS_EXECUTOR
 
-print(string.format("[DELR-TEST] Environment: %s", IS_EXECUTOR and "Executor" or "Roblox Studio"))
-
--- ── Bundle loading ────────────────────────────────────────────────────────────
--- Mirrors Script-Hub/Universal.lua: try local readfile, then raw GitHub URL.
-
-local LOCAL_PATHS = {
-    "Dev\\Delirium\\Delirium.lua",
-    "Delirium.lua",
-}
-local RAW_URL = "https://raw.githubusercontent.com/DanteLuau/Delirium-Projects/refs/heads/main/Delirium.lua"
-
-local function _safeCompile(code)
-    local loadFn = (getgenv and getgenv().loadstring) or loadstring or load
-    if type(loadFn) ~= "function" then
-        error("No loadstring/load function available in executor environment")
-    end
-    local fn, err = loadFn(code)
-    if not fn then error("loadstring compilation failed: " .. tostring(err)) end
-    return fn()
-end
-
-local Delirium = nil
-
-if IS_EXECUTOR then
-    -- 1. Try local file
-    for _, path in ipairs(LOCAL_PATHS) do
-        local src, readErr = pcall(readfile, path)
-        if src and type(readErr) == "string" and #readErr > 100 then
-            local ok, res = pcall(function() return _safeCompile(readErr) end)
-            if ok and res then
-                Delirium = res
-                print("[DELR-TEST] Loaded Delirium from LOCAL: " .. path)
-                break
-            end
-        end
-    end
-    -- 2. Fall back to raw URL
-    if not Delirium then
-        local cacheBustUrl = RAW_URL .. "?t=" .. tostring(tick())
-        local codeOk, rawCode = pcall(game.HttpGet, game, cacheBustUrl)
-        if codeOk and type(rawCode) == "string" and #rawCode > 500 then
-            local ok, res = pcall(_safeCompile, rawCode)
-            if ok and res then
-                Delirium = res
-                print("[DELR-TEST] Loaded Delirium from REMOTE URL")
-            end
-        end
-    end
-else
-    -- Studio: the production bundle requires executor-only APIs (getgenv,
-    -- loadstring, readfile). It cannot execute in Roblox Studio.
+if not IS_EXECUTOR then
+    print("[DELR-TEST] Environment: Roblox Studio")
     print("[DELR-TEST] SKIP — Executor-only environment required")
-    print("[DELR-TEST] The Delirium production bundle depends on executor APIs")
-    print("[DELR-TEST] (getgenv/loadstring/readfile) and cannot execute in Roblox Studio.")
+    print("[DELR-TEST] Delirium bundle loading needs executor APIs (game:HttpGet / loadstring).")
     return
 end
 
-if not Delirium then
-    print("[DELR-TEST] FATAL — Cannot load Delirium runtime.")
-    print("[DELR-TEST] Detected execution context:")
-    print("[DELR-TEST]   script: " .. tostring(script))
-    print("[DELR-TEST]   parent: " .. tostring(script and script.Parent))
-    print("[DELR-TEST]   parent.parent: " .. tostring(script and script.Parent and script.Parent.Parent))
-    print("[DELR-TEST] Expected: a single bundled Delirium.lua loaded via loadstring")
-    print("[DELR-TEST]   (local readfile or raw GitHub URL).")
-    print("[DELR-TEST] If running as an executor script, ensure readfile can reach")
-    print("[DELR-TEST]   Delirium.lua or that game:HttpGet can reach the raw URL.")
+print("[DELR-TEST] Environment: Executor")
+
+-- ── Bundle loading — RAW GITHUB URL ONLY ───────────────────────────────────────
+-- The harness is fully independent of where RuntimeTest.client.lua is located.
+-- The raw GitHub URL below is the ONLY source of Delirium. No local filesystem,
+-- no DataModel paths, no workspace paths are consulted.
+
+local RAW_URL = "https://raw.githubusercontent.com/DanteLuau/Delirium-Projects/refs/heads/main/dist/Delirium.lua"
+
+-- Resolve loadstring from the executor environment.
+local loadFn = (getgenv and getgenv().loadstring) or loadstring or load
+if type(loadFn) ~= "function" then
+    print("[DELR-TEST] FATAL — No loadstring function available")
+    print("[DELR-TEST] Error: executor does not expose loadstring/load")
     return
 end
+
+print("[DELR-TEST] Loading Delirium from RAW GitHub:")
+print("[DELR-TEST] URL: " .. RAW_URL)
+
+-- Step 1: HTTP GET the bundle.
+local getOk, rawCode = pcall(game.HttpGet, game, RAW_URL)
+if not getOk or type(rawCode) ~= "string" or #rawCode < 100 then
+    print("[DELR-TEST] FATAL — RAW HTTP GET failed")
+    print("[DELR-TEST] Error: " .. tostring(getOk and ("Empty or short response (" .. tostring(type(rawCode)) .. ")") or rawCode))
+    return
+end
+
+-- Step 2: loadstring compilation.
+local compileOk, compiled, compileErr = pcall(loadFn, rawCode)
+if not compileOk or type(compiled) ~= "function" then
+    print("[DELR-TEST] FATAL — Delirium bundle compilation failed")
+    print("[DELR-TEST] Error: " .. tostring(compileOk and (compileErr or "compiled result is not a function") or compiled))
+    return
+end
+
+-- Step 3: execute the compiled bundle.
+local execOk, Delirium = pcall(compiled)
+if not execOk then
+    print("[DELR-TEST] FATAL — Delirium bundle execution failed")
+    print("[DELR-TEST] Error: " .. tostring(Delirium))
+    return
+end
+
+-- Step 4: validate the returned API.
+if type(Delirium) ~= "table" or type(Delirium.CreateWindow) ~= "function" then
+    print("[DELR-TEST] FATAL — Invalid Delirium API returned")
+    print("[DELR-TEST] Expected table with CreateWindow()")
+    return
+end
+
+print("[DELR-TEST] Loaded Delirium from RAW GitHub")
+print("[DELR-TEST] Version: " .. tostring(Delirium.Version or "?"))
 
 -- ── Harness state ─────────────────────────────────────────────────────────────
 local Results = { pass = 0, fail = 0, skip = 0 }
