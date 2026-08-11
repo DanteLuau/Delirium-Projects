@@ -1359,7 +1359,10 @@ function Runtime:Destroy()
     self._alive = false
 
     -- 1. Destroy windows (cascade: Window → Tab → Section → Component)
-    for _, win in ipairs(self._windows) do
+    -- Snapshot first: Window:Destroy() unregisters itself from self._windows,
+    -- which would otherwise shift entries and make ipairs skip windows.
+    local windows = { table.unpack(self._windows) }
+    for _, win in ipairs(windows) do
         pcall(function() win:Destroy() end)
     end
     table.clear(self._windows)
@@ -3249,7 +3252,10 @@ function Window:Destroy()
         pcall(function() self._runtime:UnregisterWindow(self) end)
     end
 
-    for _, tab in ipairs(self._tabs) do
+    -- Snapshot first: Tab:Destroy() removes itself from self._tabs, which
+    -- would otherwise shift entries and make ipairs skip tabs.
+    local tabs = { table.unpack(self._tabs) }
+    for _, tab in ipairs(tabs) do
         pcall(function() tab:Destroy() end)
     end
     table.clear(self._tabs)
@@ -7659,6 +7665,9 @@ function UnloadService.Unload(config: table?)
         end
         pcall(function() _maid:DoCleaning() end)
         pcall(function() NotificationService.Reset() end)
+        -- Reset all registered services (ThemeEngine listeners, Dialog, Input,
+        -- Config cache, etc.) so no stale state survives an Unload.
+        pcall(ServiceRegistry.ResetAll)
         if targetRuntime and type(targetRuntime.IsAlive) == "function" and targetRuntime:IsAlive() then
             pcall(function() targetRuntime:Destroy() end)
         end
@@ -7769,10 +7778,14 @@ local function _createGui(): ScreenGui
     if not ok then
         local lp = Players.LocalPlayer
         if not lp then
-            pcall(function()
-                lp = Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
-            end)
-            lp = lp or Players.LocalPlayer
+            -- Bounded wait: never block Bootstrap forever if LocalPlayer is slow.
+            -- An unbounded :Wait() here would hang loadstring()() and the library
+            -- would never return its API.
+            for _ = 1, 120 do
+                lp = Players.LocalPlayer
+                if lp then break end
+                task.wait(0.1)
+            end
         end
         if lp then
             gui.Parent = lp:WaitForChild("PlayerGui")
