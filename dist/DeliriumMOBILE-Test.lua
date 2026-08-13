@@ -1,4 +1,4 @@
--- Delirium v1.2.0
+-- Delirium v1.2.0  [Delirium.lua]
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -1436,6 +1436,8 @@ function InputAdapter.Reset()
     -- Fresh Maid and reconnect
     _maid = Maid.new()
     _wireConnections()
+    -- P2: clear pointer ownership so stale owners from a previous exec can't block new gestures.
+    _pointerOwner = nil
 end
 
 -- ─── Public API ───────────────────────────────────────────────────────────────
@@ -1567,6 +1569,82 @@ function InputAdapter.BindAdaptiveInteraction(guiObject: GuiObject, callbacks: t
     return function()
         localMaid:DoCleaning()
     end
+end
+
+-- ─── P2: Centralized input constants ───────────────────────────────────────────
+--
+-- Single source of truth for drag deadzone thresholds and scroll classification.
+-- Components and Window.lua reference these instead of defining their own.
+--
+-- Why separate values for mouse vs touch:
+--   Mouse   — pixel-precise; 5px deadzone prevents jitter on click-without-drag.
+--   Touch   — contact area is ~44px and position is imprecise; 8px gives a
+--             comfortable deadzone before committing to a drag gesture.
+-- GESTURE_THRESHOLD is larger than DRAG_THRESHOLD so ambiguous small movements
+-- stay undecided long enough to classify scroll-vs-drag intent accurately.
+
+InputAdapter.DRAG_THRESHOLD_MOUSE = 5    -- px: mouse minimum movement to start drag
+InputAdapter.DRAG_THRESHOLD_TOUCH = 8    -- px: touch minimum movement to start drag
+InputAdapter.GESTURE_THRESHOLD    = 10   -- px: minimum movement before scroll-vs-drag is classified
+InputAdapter.SCROLL_DOMINANCE     = 1.4  -- dy must be >= dx * this to classify as scroll intent
+
+-- ─── P2: Pointer utilities ────────────────────────────────────────────────────
+
+-- GetPointerPosition(input) → Vector2
+-- Returns the 2D screen position of a mouse or touch input, discarding the
+-- Z component Roblox includes in input.Position (used for mouse wheel delta).
+function InputAdapter.GetPointerPosition(input: InputObject): Vector2
+    return Vector2.new(input.Position.X, input.Position.Y)
+end
+
+-- IsScrollIntent(delta) → boolean
+-- Returns true when the movement delta has dominant vertical intent,
+-- suggesting the user means to scroll rather than perform a horizontal drag.
+-- delta: Vector2 — (currentPosition - startPosition) or InputChanged delta.
+function InputAdapter.IsScrollIntent(delta: Vector2): boolean
+    local ax = math.abs(delta.X)
+    local ay = math.abs(delta.Y)
+    return ay >= ax * InputAdapter.SCROLL_DOMINANCE
+end
+
+-- ─── P2: Pointer ownership ────────────────────────────────────────────────────
+--
+-- Lightweight cooperative ownership model for pointer/touch gestures.
+-- Any system that begins a pointer interaction can claim ownership;
+-- other systems check ClaimPointer before stealing the gesture.
+--
+-- Ownership is ADVISORY — components are not forced to yield, but
+-- well-behaved consumers should respect ClaimPointer's return value.
+-- Per-component enforcement wires into this in P3.
+
+local _pointerOwner = nil  -- any comparable value: string tag or object reference
+
+-- Claim the active pointer for `owner`.
+-- Returns true  → claim succeeded (no prior owner, or owner is self).
+-- Returns false → another system already owns the pointer.
+function InputAdapter.ClaimPointer(owner): boolean
+    if _pointerOwner == nil or _pointerOwner == owner then
+        _pointerOwner = owner
+        return true
+    end
+    return false
+end
+
+-- Release the pointer. Silent no-op if `owner` is not the current owner.
+function InputAdapter.ReleasePointer(owner)
+    if _pointerOwner == owner then
+        _pointerOwner = nil
+    end
+end
+
+-- Force-release regardless of current owner. Used during cleanup / window destroy.
+function InputAdapter.ForceReleasePointer()
+    _pointerOwner = nil
+end
+
+-- Returns the current owner, or nil if unclaimed.
+function InputAdapter.GetPointerOwner()
+    return _pointerOwner
 end
 
 -- ─── Self-register ────────────────────────────────────────────────────────────
@@ -2907,6 +2985,7 @@ local DialogService     = _Delirium_require("Services.DialogService")
 local UnloadService     = _Delirium_require("Services.UnloadService")
 local Tab               = _Delirium_require("Layout.Tab")
 local DeviceDetector    = _Delirium_require("Utilities.DeviceDetector")
+local InputAdapter      = _Delirium_require("Core.InputAdapter")
 
 local TITLEBAR_H     = 45
 local BUTTON_SIZE    = 28
@@ -2921,12 +3000,16 @@ local RESIZE_THRESHOLD_MOUSE =  5   -- px deadzone (mouse)
 local RESIZE_THRESHOLD_TOUCH = 10   -- px deadzone (touch)
 
 -- Drag deadzone: minimum movement before a drag gesture commits.
--- Mirrors the resize deadzone pattern — prevents micro-twitches from
--- registering as drags on tap/click without intentional movement.
-local DRAG_THRESHOLD_MOUSE  =  5   -- px (mouse)
-local DRAG_THRESHOLD_TOUCH  =  8   -- px (touch)
+-- P2: Thresholds are centralized in Core/InputAdapter.lua.
+--     Reference: InputAdapter.DRAG_THRESHOLD_MOUSE / InputAdapter.DRAG_THRESHOLD_TOUCH
 local RESIZE_MIN_W_DEFAULT   = 240  -- px
 local RESIZE_MIN_H_DEFAULT   = 160  -- px
+
+-- P0: Responsive spawn margins.
+-- Minimum gap between Window edges and the viewport boundary at creation time.
+-- These are one-shot constraints — the user may drag/resize to the edge afterward.
+local SPAWN_MARGIN_H = 20   -- px per side, horizontal
+local SPAWN_MARGIN_V = 16   -- px per side, vertical (applied to usable area after insets)
 
 -- ─── Focus / ZIndex management ───────────────────────────────────────────────
 -- Module-local monotonic counter. Every time a Window receives focus it claims
@@ -2937,6 +3020,88 @@ local _focusCounter = 0
 local function _nextFocusZ(): number
     _focusCounter = _focusCounter + 1
     return _focusCounter
+end
+
+-- ─── P0: Responsive sizing helpers (module-level, no self) ──────────────────
+--
+-- _computeSize(preferred?)
+--   Constrains the preferred Window size to the current usable viewport.
+--   Rule set (P0.1 – P0.5):
+--     • Preferred fits → return it unchanged.
+--     • Preferred overflows → clamp to (viewport - margins).
+--     • No preferred → derive a proportional default from the viewport.
+--     • Never go below RESIZE_MIN_W_DEFAULT × RESIZE_MIN_H_DEFAULT.
+--     • On desktop (large viewport) the original default size is preserved.
+--
+local function _computeSize(preferred: UDim2?): UDim2
+    local vp    = DeviceDetector:GetViewport()
+    local ready = DeviceDetector:IsViewportReady()
+
+    local prefW: number
+    local prefH: number
+    if preferred then
+        prefW = preferred.X.Offset
+        prefH = preferred.Y.Offset
+    end
+
+    -- Viewport unavailable: trust caller for desktop, cap for mobile.
+    if not ready then
+        if DeviceDetector:IsMobile() then
+            return UDim2.fromOffset(
+                math.clamp(prefW or 340, RESIZE_MIN_W_DEFAULT, 340),
+                math.clamp(prefH or 300, RESIZE_MIN_H_DEFAULT, 300)
+            )
+        end
+        return UDim2.fromOffset(prefW or 580, prefH or 380)
+    end
+
+    -- Viewport ready: derive usable area, applying GuiInset on both axes.
+    local topLeft, bottomRight = GuiService:GetGuiInset()
+    local usableH = vp.Y - topLeft.Y - bottomRight.Y
+
+    -- Maximum allowed dimensions: viewport minus per-side spawn margins.
+    local maxW = math.max(RESIZE_MIN_W_DEFAULT, vp.X    - SPAWN_MARGIN_H * 2)
+    local maxH = math.max(RESIZE_MIN_H_DEFAULT, usableH - SPAWN_MARGIN_V * 2)
+
+    -- No preferred size: compute a proportional default from the viewport.
+    -- Phone-sized viewports get scaled-down defaults; desktop keeps 580×380.
+    if not prefW then
+        if vp.X < 600 then
+            prefW = math.floor(vp.X    * 0.82)
+            prefH = math.floor(usableH * 0.60)
+        else
+            prefW = 580
+            prefH = 380
+        end
+    end
+
+    -- Clamp: this is the core constraint missing when config.Size was provided.
+    -- On desktop with a large viewport maxW >> 580 so preferred passes through unchanged.
+    local finalW = math.clamp(prefW, RESIZE_MIN_W_DEFAULT, maxW)
+    local finalH = math.clamp(prefH, RESIZE_MIN_H_DEFAULT, maxH)
+    return UDim2.fromOffset(finalW, finalH)
+end
+
+-- _computeInitialPosition()
+--   Centers the Window in the USABLE viewport (below Roblox topbar, above home-bar).
+--   With AnchorPoint(0.5,0.5) and scale(0.5,…) origin, an offset of 0 centers in
+--   the TOTAL viewport; we add a Y-offset to re-center in the narrower usable area.
+--   On desktop the shift is ~18 px — visually imperceptible and technically correct.
+--
+local function _computeInitialPosition(): UDim2
+    local vp    = DeviceDetector:GetViewport()
+    local ready = DeviceDetector:IsViewportReady()
+    if not ready then
+        return UDim2.fromScale(0.5, 0.5)
+    end
+    local topLeft, bottomRight = GuiService:GetGuiInset()
+    local topInset    = topLeft.Y
+    local bottomInset = bottomRight.Y
+    local usableH     = vp.Y - topInset - bottomInset
+    -- Midpoint of the usable area in screen-space Y, then convert to a scale(0.5) offset.
+    local usableMidY  = topInset + usableH * 0.5
+    local offY        = usableMidY - vp.Y * 0.5
+    return UDim2.new(0.5, 0, 0.5, math.floor(offY))
 end
 
 local Window = {}
@@ -2969,42 +3134,18 @@ function Window.new(config: table, parentGui: ScreenGui)
     self._isResizing    = false
     self._resizeHandle  = nil
 
-    -- Compute a sensible default size that fits on the current screen.
-    -- On narrow phones (< 420px wide) the 580px default clips off-screen;
-    -- clamp to 94% of viewport while keeping the minimum usable at 320x320.
-    local function _responsiveDefaultSize(): UDim2
-        -- DeviceDetector is the single source of truth for viewport + platform state.
-        -- Removes duplicate camera reads from Window.lua; multi-signal fallback logic
-        -- lives in DeviceDetector which evaluates UIS signals regardless of camera.
-        local vp = DeviceDetector:GetViewport()
-        if not DeviceDetector:IsViewportReady() then
-            return DeviceDetector:IsMobile()
-                and UDim2.fromOffset(340, 300)  -- mobile-safe: fits any phone >= 320px wide
-                or  UDim2.fromOffset(580, 380)  -- desktop: original default
-        end
-        if vp.X < 600 then
-            -- Phone-sized viewport — visible margins so the window
-            -- doesn't feel fullscreen. 82% width leaves ~35px margin each side.
-            local w = math.clamp(math.floor(vp.X * 0.82), 300, 400)
-            local h = math.clamp(math.floor(vp.Y * 0.60), 280, 360)
-            return UDim2.fromOffset(w, h)
-        else
-            -- Desktop / tablet landscape: original sizing
-            local w = math.clamp(math.floor(vp.X * 0.94), 320, 580)
-            local h = math.clamp(math.floor(vp.Y * 0.70), 320, 380)
-            return UDim2.fromOffset(w, h)
-        end
-    end
-
     -- Store original size for Restore().
-    self._originalSize = config.Size or _responsiveDefaultSize()
+    -- P0: _computeSize() applies viewport-aware clamping regardless of whether
+    -- config.Size was provided. Previously, a caller-supplied config.Size bypassed
+    -- all responsive logic, spawning a 580px-wide window on a 390px phone screen.
+    self._originalSize = _computeSize(config.Size)
 
     -- ─── Main frame ──────────────────────────────────────────────────────
 
     self.MainFrame = ComponentHelper.Create("CanvasGroup", {
         Name              = "DeliriumMainFrame",
         Size              = self._originalSize,
-        Position          = UDim2.fromScale(0.5, 0.5),
+        Position          = _computeInitialPosition(),
         AnchorPoint       = Vector2.new(0.5, 0.5),
         BackgroundColor3  = ThemeEngine.GetToken("Background"),
         BorderSizePixel   = 0,
@@ -3068,6 +3209,12 @@ function Window.new(config: table, parentGui: ScreenGui)
         Parent                 = self.TitleBar,
     })
 
+    -- P1: Title fills available horizontal space minus explicit room for the ButtonRow.
+    -- The old 0.6 fraction caused TitleLabel to overlap ButtonRow on narrow windows
+    -- (e.g. at 240px: title right=160px, ButtonRow left=148px → 12px overlap).
+    -- BUTTON_ROW_W (92px) + 8px gap = 100px reserved; consistent 8px clearance at every width.
+    local TITLE_RESERVE = BUTTON_ROW_W + 8   -- 100px: buttons (92) + gap (8)
+
     self.TitleLabel = ComponentHelper.Create("TextLabel", {
         Name                   = "TitleLabel",
         Text                   = self.Name,
@@ -3075,7 +3222,7 @@ function Window.new(config: table, parentGui: ScreenGui)
         TextSize               = 16,
         TextColor3             = ThemeEngine.GetToken("Text"),
         TextXAlignment         = Enum.TextXAlignment.Left,
-        Size                   = UDim2.new(0.6, 0, 1, 0),
+        Size                   = UDim2.new(1, -TITLE_RESERVE, 1, 0),
         Position               = UDim2.new(0, 0, 0.20, 0),
         BackgroundTransparency = 1,
         Parent                 = self.TitleBar,
@@ -3089,12 +3236,12 @@ function Window.new(config: table, parentGui: ScreenGui)
             TextSize               = 12,
             TextColor3             = ThemeEngine.GetToken("SubText"),
             TextXAlignment         = Enum.TextXAlignment.Left,
-            Size                   = UDim2.new(0.6, 0, 1, 0),
+            Size                   = UDim2.new(1, -TITLE_RESERVE, 1, 0),
             Position               = UDim2.new(0, 0, 0.30, 0),
             BackgroundTransparency = 1,
             Parent                 = self.TitleBar,
         })
-        self.TitleLabel.Size = UDim2.new(0.6, 0, 0.45, 0)
+        self.TitleLabel.Size = UDim2.new(1, -TITLE_RESERVE, 0.45, 0)
     end
 
     -- ─── Title bar buttons: [⌘] [−] [×] ─────────────────────────────────
@@ -3155,20 +3302,25 @@ function Window.new(config: table, parentGui: ScreenGui)
     local isCompact = config.Compact == true or config.Tabs == false or config.NoTabs == true
     self._isCompact = isCompact
 
-    -- DeviceDetector: single authoritative source for mobile/viewport state.
-    -- Mirrors _responsiveDefaultSize() — no duplicate camera reads in Window.lua.
-    local _vp       = DeviceDetector:GetViewport()
-    local _isMobile = DeviceDetector:IsViewportReady()
-        and (_vp.X < 600)
-        or  DeviceDetector:IsMobile()
-    local SIDENAV_W = isCompact and 0 or (_isMobile and 110 or 140)
+    -- P1: Responsive sidenav width.
+    -- Prefer the established desktop width (140px); never exceed 35% of the
+    -- initial Window width so the content area always retains usable space.
+    -- On isCompact mode the sidenav is hidden entirely (0px).
+    -- The 35% ratio preserves the desktop layout on wide windows (35% of 400px+ >= 140)
+    -- while proportionally yielding space to content on narrower phone windows.
+    local windowW        = self._originalSize.X.Offset
+    local SIDENAV_DEST_W = 140   -- existing desktop target; preserved on wide windows
+    local navW = isCompact and 0
+        or math.min(SIDENAV_DEST_W, math.floor(windowW * 0.35))
+    -- Show scrollbar on narrow sidenavs where touch-scrolling many tabs is likely.
+    local navScrollBar = (navW > 0 and navW < SIDENAV_DEST_W) and 2 or 0
 
     self.SideNav = ComponentHelper.Create("ScrollingFrame", {
         Name                   = "SideNav",
-        Size                   = UDim2.new(0, SIDENAV_W, 1, 0),
+        Size                   = UDim2.new(0, navW, 1, 0),
         BackgroundTransparency = 1,
         BorderSizePixel        = 0,
-        ScrollBarThickness     = _isMobile and 2 or 0,
+        ScrollBarThickness     = navScrollBar,
         Visible                = not isCompact,
         Parent                 = self.ContentContainer,
     })
@@ -3189,7 +3341,7 @@ function Window.new(config: table, parentGui: ScreenGui)
     local divider = ComponentHelper.Create("Frame", {
         Name             = "NavDivider",
         Size             = UDim2.new(0, 1, 1, -16),
-        Position         = UDim2.new(0, SIDENAV_W, 0, 8),
+        Position         = UDim2.new(0, navW, 0, 8),
         BackgroundColor3 = ThemeEngine.GetToken("Border"),
         BorderSizePixel  = 0,
         Visible          = not isCompact,
@@ -3198,8 +3350,8 @@ function Window.new(config: table, parentGui: ScreenGui)
 
     self.PageView = ComponentHelper.Create("Frame", {
         Name                   = "PageView",
-        Size                   = isCompact and UDim2.new(1, 0, 1, 0) or UDim2.new(1, -(SIDENAV_W + 1), 1, 0),
-        Position               = isCompact and UDim2.new(0, 0, 0, 0) or UDim2.new(0, SIDENAV_W + 1, 0, 0),
+        Size                   = isCompact and UDim2.new(1, 0, 1, 0) or UDim2.new(1, -(navW + 1), 1, 0),
+        Position               = isCompact and UDim2.new(0, 0, 0, 0) or UDim2.new(0, navW + 1, 0, 0),
         BackgroundTransparency = 1,
         Parent                 = self.ContentContainer,
     })
@@ -3425,6 +3577,7 @@ end
 
 function Window:_EnableDragging()
     local dragStart, startPos
+    local activeDragTouch = nil  -- P2: touch input object for the active drag gesture
 
     -- Wire to DragZone TextButton (not TitleBar Frame) so touch is consumed
     -- by the GUI system and does not also rotate the game camera.
@@ -3437,6 +3590,12 @@ function Window:_EnableDragging()
         end
         -- Block drag while a resize gesture is active.
         if self._isResizing then return end
+        -- P2: Multi-touch safety — ignore new touches while a drag gesture is already
+        -- active. Without this guard a second finger on DragZone overwrites dragStart/
+        -- startPos, corrupting the in-flight gesture for the first finger.
+        if input.UserInputType == Enum.UserInputType.Touch and activeDragTouch ~= nil then
+            return
+        end
         -- Focus: clicking/dragging the titlebar raises this window.
         self:_Focus()
         -- Stage 1: pending — record origin, wait for deadzone crossing in InputChanged.
@@ -3446,6 +3605,8 @@ function Window:_EnableDragging()
         self._isDragging  = false
         dragStart         = input.Position
         startPos          = self.MainFrame.Position
+        -- P2: Record which touch started this drag so unrelated touches are ignored.
+        activeDragTouch = (input.UserInputType == Enum.UserInputType.Touch) and input or nil
     end))
 
     self._maid:GiveTask(UserInputService.InputChanged:Connect(function(input)
@@ -3454,13 +3615,19 @@ function Window:_EnableDragging()
             and input.UserInputType ~= Enum.UserInputType.Touch then
             return
         end
+        -- P2: Touch identity check — only track the touch that started this drag.
+        -- Unrelated second-finger movements are silently ignored so they cannot
+        -- corrupt the in-flight drag position or prematurely commit the gesture.
+        if input.UserInputType == Enum.UserInputType.Touch and input ~= activeDragTouch then
+            return
+        end
 
         local delta   = input.Position - dragStart
         local isTouch = (input.UserInputType == Enum.UserInputType.Touch)
 
         -- Stage 2: commit — promote pending → active once deadzone is crossed.
         if self._dragPending then
-            local threshold = isTouch and DRAG_THRESHOLD_TOUCH or DRAG_THRESHOLD_MOUSE
+            local threshold = isTouch and InputAdapter.DRAG_THRESHOLD_TOUCH or InputAdapter.DRAG_THRESHOLD_MOUSE
             if delta.Magnitude < threshold then return end
             self._dragPending = false
             self._isDragging  = true
@@ -3482,10 +3649,19 @@ function Window:_EnableDragging()
     end))
 
     self._maid:GiveTask(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- Mouse release always ends drag.
             self._isDragging  = false
             self._dragPending = false
+            activeDragTouch   = nil
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            -- P2: Only reset drag state when the specific touch that started it ends.
+            -- A different (unrelated) touch ending must not cancel an active drag gesture.
+            if input == activeDragTouch then
+                self._isDragging  = false
+                self._dragPending = false
+                activeDragTouch   = nil
+            end
         end
     end))
 end
@@ -3493,9 +3669,13 @@ end
 -- ─── Dragging — MiniIconFrame ──────────────────────────────────────────────
 
 function Window:_EnableMiniIconDragging()
-    local DRAG_THRESHOLD = 5   -- pixels; below this treat input as a click
-    local dragging       = false
+    -- P2: Thresholds from InputAdapter (centralized).
+    -- Mouse uses a smaller deadzone (pixel-precise); touch uses a larger one
+    -- (imprecise finger contact). Old code applied the mouse threshold (5px)
+    -- to both input types, making touch drag too sensitive.
+    local dragging        = false
     local dragStart, startPos
+    local activeMiniTouch = nil  -- P2: touch identity for the active mini-icon drag
 
     -- Wire to hitbox, NOT frame — the TextButton on top intercepts all InputBegan
     -- events before they reach the parent Frame, so frame.InputBegan never fires.
@@ -3504,18 +3684,30 @@ function Window:_EnableMiniIconDragging()
             and input.UserInputType ~= Enum.UserInputType.Touch then
             return
         end
+        -- P2: Ignore new touches while a drag is already active.
+        if input.UserInputType == Enum.UserInputType.Touch and dragging then
+            return
+        end
         dragging            = true
         self._miniDragMoved = false
         dragStart           = input.Position
         startPos            = self._miniIconFrame.Position
+        activeMiniTouch     = (input.UserInputType == Enum.UserInputType.Touch) and input or nil
     end))
 
     self._maid:GiveTask(UserInputService.InputChanged:Connect(function(input)
         if not dragging then return end
+        -- P2: Touch identity check — only track the touch that started this drag.
+        if input.UserInputType == Enum.UserInputType.Touch and input ~= activeMiniTouch then
+            return
+        end
         if input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - dragStart
-            if delta.Magnitude > DRAG_THRESHOLD then
+            local delta     = input.Position - dragStart
+            local threshold = (input.UserInputType == Enum.UserInputType.Touch)
+                and InputAdapter.DRAG_THRESHOLD_TOUCH
+                or  InputAdapter.DRAG_THRESHOLD_MOUSE
+            if delta.Magnitude > threshold then
                 self._miniDragMoved = true
             end
             local newPos = self:_ClampToScreen(
@@ -3528,9 +3720,15 @@ function Window:_EnableMiniIconDragging()
     end))
 
     self._maid:GiveTask(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging        = false
+            activeMiniTouch = nil
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            -- P2: Only reset if this is the active mini-icon drag touch.
+            if input == activeMiniTouch then
+                dragging        = false
+                activeMiniTouch = nil
+            end
         end
     end))
 end
@@ -3570,11 +3768,12 @@ function Window:_EnableResizing()
     self._resizeHandle = handle
 
     -- ── Per-gesture state ──────────────────────────────────────────────────
-    local resizing     = false
-    local resizeStart  = nil  -- Vector3 input.Position at gesture start
-    local startSize    = nil  -- Vector2 frame AbsoluteSize at gesture start
-    local startPos     = nil  -- UDim2  frame Position at gesture start
-    local startTopLeft = nil  -- Vector2 screen-space top-left corner (stays fixed)
+    local resizing          = false
+    local resizeStart       = nil  -- Vector3 input.Position at gesture start
+    local startSize         = nil  -- Vector2 frame AbsoluteSize at gesture start
+    local startPos          = nil  -- UDim2  frame Position at gesture start
+    local startTopLeft      = nil  -- Vector2 screen-space top-left corner (stays fixed)
+    local activeResizeTouch = nil  -- P2: touch input object for the active resize gesture
 
     -- InputBegan on handle → begin gesture
     self._maid:GiveTask(handle.InputBegan:Connect(function(input)
@@ -3587,6 +3786,11 @@ function Window:_EnableResizing()
             return
         end
 
+        -- P2: Ignore additional touches while a resize is already in progress.
+        if input.UserInputType == Enum.UserInputType.Touch and resizing then
+            return
+        end
+
         local cam = workspace.CurrentCamera
         local vp  = (cam and cam.ViewportSize) or Vector2.new(1920, 1080)
 
@@ -3595,6 +3799,8 @@ function Window:_EnableResizing()
         resizeStart       = input.Position
         startPos          = self.MainFrame.Position
         startSize         = self.MainFrame.AbsoluteSize
+        -- P2: Record which touch started the resize gesture.
+        activeResizeTouch = (input.UserInputType == Enum.UserInputType.Touch) and input or nil
 
         -- Top-left corner in screen space; stays fixed during a bottom-right resize.
         -- MainFrame AnchorPoint = (0.5, 0.5), scale position = (0.5, 0.5).
@@ -3612,6 +3818,11 @@ function Window:_EnableResizing()
         if self.IsMinimized or self.IsMiniIcon then return end
         if input.UserInputType ~= Enum.UserInputType.MouseMovement
             and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        -- P2: Touch identity check — only track the touch that started this resize.
+        -- An unrelated second finger must not drive the resize or corrupt its state.
+        if input.UserInputType == Enum.UserInputType.Touch and input ~= activeResizeTouch then
             return
         end
 
@@ -3645,13 +3856,15 @@ function Window:_EnableResizing()
     -- InputEnded (global) → commit resize, release lock
     self._maid:GiveTask(UserInputService.InputEnded:Connect(function(input)
         if not resizing then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then
-            return
-        end
+        -- P2: Only commit when the input that started the resize ends.
+        -- Mouse: MouseButton1 always matches. Touch: only the tracked touch identity.
+        local isActiveEnd = (input.UserInputType == Enum.UserInputType.MouseButton1)
+            or (input.UserInputType == Enum.UserInputType.Touch and input == activeResizeTouch)
+        if not isActiveEnd then return end
 
-        resizing         = false
-        self._isResizing = false
+        resizing          = false
+        self._isResizing  = false
+        activeResizeTouch = nil
 
         -- Commit: update _originalSize so Minimize → Restore uses the resized dimensions.
         local sz = self.MainFrame.AbsoluteSize
@@ -4325,6 +4538,7 @@ local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
 local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
 local Signal           = _Delirium_require("Utilities.Signal")
+local InputAdapter     = _Delirium_require("Core.InputAdapter")
 
 local ColorPicker = {}
 
@@ -4362,8 +4576,8 @@ local GestureState = {
     YIELDED = "YIELDED",
 }
 
-local GESTURE_THRESHOLD  = 10   -- px before intent is classified
-local HUE_DOMINANCE      = 1.5  -- dy must exceed dx by this factor for hue strip vertical drag
+-- P3: gesture threshold replaced by InputAdapter.GESTURE_THRESHOLD (= 10, same value).
+local HUE_DOMINANCE = 1.5  -- dy must exceed dx by this factor for hue strip vertical drag (picker-specific)
 
 function ColorPicker.New(parent: Instance, config: table)
     config = config or {}
@@ -4562,10 +4776,12 @@ function ColorPicker.New(parent: Instance, config: table)
     --   ScrollingEnabled = false on the ancestor PageCanvas. Restore on reset.
     --   YIELDED gestures do NOT lock — the page scroll should own those.
 
-    local gestureState  = GestureState.IDLE
-    local gestureStartX = 0
-    local gestureStartY = 0
-    local globalConns   = {}
+    local gestureState       = GestureState.IDLE
+    local gestureStartX      = 0
+    local gestureStartY      = 0
+    local globalConns        = {}
+    local activeGestureTouch = nil  -- P3: touch InputObject that started the active gesture
+    local pointerOwner       = {}   -- P3: unique table identity for InputAdapter.ClaimPointer
 
     -- Lazy ancestor PageCanvas reference — walked once from Row, then cached.
     -- Rechecked via .Parent to avoid holding a stale destroyed-instance ref.
@@ -4597,7 +4813,10 @@ function ColorPicker.New(parent: Instance, config: table)
         if gestureState == GestureState.SV or gestureState == GestureState.HUE then
             rebuildColor(true)  -- force fire final exact color on release
         end
-        gestureState = GestureState.IDLE
+        gestureState       = GestureState.IDLE
+        activeGestureTouch = nil
+        -- P3: Release pointer ownership so other components can claim.
+        InputAdapter.ReleasePointer(pointerOwner)
         _unlockPageScroll()  -- always safe to call; no-op if already enabled
     end
 
@@ -4620,13 +4839,18 @@ function ColorPicker.New(parent: Instance, config: table)
     table.insert(globalConns, SVSquare.InputBegan:Connect(function(input)
         if not enabled then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- P3: Claim pointer for immediate mouse gesture.
+            if not InputAdapter.ClaimPointer(pointerOwner) then return end
             gestureState = GestureState.SV
             applySV(input.Position)
         elseif input.UserInputType == Enum.UserInputType.Touch then
             if gestureState == GestureState.IDLE then
-                gestureState  = GestureState.PENDING
-                gestureStartX = input.Position.X
-                gestureStartY = input.Position.Y
+                -- P3: Block if another component already owns the pointer.
+                if InputAdapter.GetPointerOwner() ~= nil then return end
+                gestureState       = GestureState.PENDING
+                gestureStartX      = input.Position.X
+                gestureStartY      = input.Position.Y
+                activeGestureTouch = input  -- P3: record touch identity
             end
         end
     end))
@@ -4635,13 +4859,18 @@ function ColorPicker.New(parent: Instance, config: table)
     table.insert(globalConns, HueStrip.InputBegan:Connect(function(input)
         if not enabled then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- P3: Claim pointer for immediate mouse gesture.
+            if not InputAdapter.ClaimPointer(pointerOwner) then return end
             gestureState = GestureState.HUE
             applyHue(input.Position)
         elseif input.UserInputType == Enum.UserInputType.Touch then
             if gestureState == GestureState.IDLE then
-                gestureState  = GestureState.PENDING
-                gestureStartX = input.Position.X
-                gestureStartY = input.Position.Y
+                -- P3: Block if another component already owns the pointer.
+                if InputAdapter.GetPointerOwner() ~= nil then return end
+                gestureState       = GestureState.PENDING
+                gestureStartX      = input.Position.X
+                gestureStartY      = input.Position.Y
+                activeGestureTouch = input  -- P3: record touch identity
             end
         end
     end))
@@ -4661,6 +4890,8 @@ function ColorPicker.New(parent: Instance, config: table)
         end
 
         if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        -- P3: Touch identity check — only process the touch that started this gesture.
+        if input ~= activeGestureTouch then return end
 
         -- ── PENDING: classify intent ──────────────────────────────────────
         if gestureState == GestureState.PENDING then
@@ -4668,12 +4899,17 @@ function ColorPicker.New(parent: Instance, config: table)
             local dy = math.abs(input.Position.Y - gestureStartY)
             local totalDelta = math.sqrt(dx * dx + dy * dy)
 
-            if totalDelta >= GESTURE_THRESHOLD then
+            if totalDelta >= InputAdapter.GESTURE_THRESHOLD then
                 -- Classify once and LOCK — never re-classifies for this gesture
                 if dy >= dx * HUE_DOMINANCE then
                     local hueAbsX = HueStrip.AbsolutePosition.X
                     local hueAbsW = HueStrip.AbsoluteSize.X
                     if gestureStartX >= hueAbsX and gestureStartX <= hueAbsX + hueAbsW then
+                        -- P3: Claim pointer for hue drag.
+                        if not InputAdapter.ClaimPointer(pointerOwner) then
+                            gestureState = GestureState.YIELDED
+                            return
+                        end
                         gestureState = GestureState.HUE
                         _lockPageScroll()  -- own the gesture; prevent PageCanvas scroll
                     else
@@ -4682,7 +4918,12 @@ function ColorPicker.New(parent: Instance, config: table)
                         -- Do NOT lock — page scroll should have this one
                     end
                 else
-                    -- Horizontal or 2D intent on SV square = SV drag
+                    -- Horizontal or 2D intent on SV square = SV drag.
+                    -- P3: Claim pointer for SV drag.
+                    if not InputAdapter.ClaimPointer(pointerOwner) then
+                        gestureState = GestureState.YIELDED
+                        return
+                    end
                     gestureState = GestureState.SV
                     _lockPageScroll()  -- own the gesture; prevent PageCanvas scroll
                 end
@@ -4701,11 +4942,17 @@ function ColorPicker.New(parent: Instance, config: table)
         -- YIELDED: do nothing, page scroll has ownership
     end))
 
-    -- Release: unconditionally reset gesture state
+    -- Release: reset gesture for the active input only
     table.insert(globalConns, UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- Mouse release always resets.
             resetGesture()
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            -- P3: Only reset if this is the touch that started the gesture.
+            -- An unrelated second finger ending must not cancel the active drag.
+            if input == activeGestureTouch then
+                resetGesture()
+            end
         end
     end))
 
@@ -4748,7 +4995,7 @@ function ColorPicker.New(parent: Instance, config: table)
 
     function api:Set(color: Color3)
         h, s, v = toHSV(color)
-        rebuildColor()
+        rebuildColor(true)
         currentColor = color
         Swatch.BackgroundColor3 = color
     end
@@ -5975,11 +6222,12 @@ local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
 local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
 local Signal           = _Delirium_require("Utilities.Signal")
+local InputAdapter     = _Delirium_require("Core.InputAdapter")
 
 local Slider = {}
 
-local TOUCH_DRAG_THRESHOLD = 10  -- px before intent is classified (raised from 6 — less hair-trigger)
-local HORIZONTAL_DOMINANCE = 1.8 -- dx must be this many times dy to confirm horizontal intent
+-- P3: gesture threshold replaced by InputAdapter.GESTURE_THRESHOLD (= 10, same value).
+local HORIZONTAL_DOMINANCE = 1.8 -- dx must be this many times dy to confirm horizontal intent (slider-specific)
 
 function Slider.New(parent: Instance, config: table)
     config = config or {}
@@ -6103,18 +6351,23 @@ function Slider.New(parent: Instance, config: table)
     --
     -- Mouse has no PENDING state — immediately enters OWNING on MouseButton1Down.
 
-    local dragging     = false   -- true = slider owns gesture, value updates allowed
-    local touchPending = false   -- true = finger down, intent not yet classified
-    local touchStartX  = 0
-    local touchStartY  = 0
-    local globalConns  = {}
+    local dragging          = false   -- true = slider owns gesture, value updates allowed
+    local touchPending      = false   -- true = finger down, intent not yet classified
+    local touchStartX       = 0
+    local touchStartY       = 0
+    local globalConns       = {}
+    local activeSliderTouch = nil     -- P3: touch InputObject that started the active gesture
+    local pointerOwner      = {}      -- P3: unique table identity for InputAdapter.ClaimPointer
 
     local function resetGesture()
         if dragging then
             applyValue(value, true)  -- force fire exact final value on release
         end
-        dragging     = false
-        touchPending = false
+        dragging          = false
+        touchPending      = false
+        activeSliderTouch = nil
+        -- P3: Release pointer ownership so other components can claim.
+        InputAdapter.ReleasePointer(pointerOwner)
     end
 
     -- Mouse: no threshold, immediate ownership.
@@ -6131,6 +6384,8 @@ function Slider.New(parent: Instance, config: table)
     table.insert(globalConns, hitArea.MouseButton1Down:Connect(function()
         if not enabled then return end
         if UserInputService:GetLastInputType() == Enum.UserInputType.Touch then return end
+        -- P3: Claim pointer ownership. Blocks if another component holds it.
+        if not InputAdapter.ClaimPointer(pointerOwner) then return end
         dragging     = true
         touchPending = false
         applyValue(computeValue(UserInputService:GetMouseLocation().X))
@@ -6140,10 +6395,15 @@ function Slider.New(parent: Instance, config: table)
     table.insert(globalConns, hitArea.InputBegan:Connect(function(input)
         if not enabled then return end
         if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        touchStartX  = input.Position.X
-        touchStartY  = input.Position.Y
-        touchPending = true
-        dragging     = false  -- ownership NOT confirmed yet
+        -- P3: Ignore new touches while a gesture is already active on this slider.
+        if activeSliderTouch ~= nil then return end
+        -- P3: Block if another component already owns the pointer.
+        if InputAdapter.GetPointerOwner() ~= nil then return end
+        touchStartX       = input.Position.X
+        touchStartY       = input.Position.Y
+        touchPending      = true
+        dragging          = false  -- ownership NOT confirmed yet
+        activeSliderTouch = input  -- P3: record which touch started this gesture
     end))
 
     -- Global move: intent classification + value update
@@ -6159,6 +6419,8 @@ function Slider.New(parent: Instance, config: table)
         end
 
         if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        -- P3: Touch identity check — only process the touch that started this gesture.
+        if input ~= activeSliderTouch then return end
 
         -- ── Touch: classify intent while PENDING ──────────────────────────
         if touchPending then
@@ -6166,13 +6428,19 @@ function Slider.New(parent: Instance, config: table)
             local dy = math.abs(input.Position.Y - touchStartY)
             local totalDelta = math.sqrt(dx * dx + dy * dy)
 
-            if totalDelta >= TOUCH_DRAG_THRESHOLD then
+            if totalDelta >= InputAdapter.GESTURE_THRESHOLD then
                 touchPending = false  -- leave PENDING regardless of direction
                 if dx >= dy * HORIZONTAL_DOMINANCE then
-                    -- Horizontal intent confirmed → slider owns gesture
+                    -- Horizontal intent confirmed → slider owns gesture.
+                    -- P3: Claim pointer ownership; yield if another component beat us.
+                    if not InputAdapter.ClaimPointer(pointerOwner) then
+                        dragging = false
+                        return
+                    end
                     dragging = true
                 else
-                    -- Vertical or ambiguous → yield to page scroll, stay IDLE
+                    -- Vertical or ambiguous → yield to page scroll.
+                    -- activeSliderTouch stays set so InputEnded cleans up correctly.
                     dragging = false
                 end
             end
@@ -6186,11 +6454,17 @@ function Slider.New(parent: Instance, config: table)
         end
     end))
 
-    -- Release: always reset gesture state
+    -- Release: reset gesture for the active input only
     table.insert(globalConns, UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            -- Mouse release always ends slider gesture.
             resetGesture()
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            -- P3: Only reset if this is the touch that started the gesture.
+            -- An unrelated second finger ending must not cancel the active drag.
+            if input == activeSliderTouch then
+                resetGesture()
+            end
         end
     end))
 
