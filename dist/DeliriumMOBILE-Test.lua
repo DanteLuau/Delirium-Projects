@@ -286,6 +286,308 @@ return ComponentHelper
 
 end
 
+-- ── Utilities.DeviceDetector ──────────────────────────────
+_Delirium_modules["Utilities.DeviceDetector"] = function()
+-- Utilities/DeviceDetector.lua
+-- Single authoritative source of device/platform classification for Delirium.
+--
+-- Consumed by Window.lua, SideNav, and any layout system that needs to know
+-- whether it is running on mobile, desktop, tablet, or console.
+--
+-- Design rules:
+--   • Never relies on a single signal alone (not just TouchEnabled, not just viewport).
+--   • Event-driven — no per-frame polling, no RenderStepped.
+--   • Camera-nil-safe: UIS input capability signals are always available regardless
+--     of camera state and are evaluated immediately on require().
+--   • Exposes readiness explicitly so callers can decide whether to wait or use
+--     the best-available estimate.
+--
+-- Platform hierarchy (in priority order):
+--   Console  → GamepadEnabled  AND  NOT KeyboardEnabled  AND  NOT TouchEnabled
+--   Desktop  → (KeyboardEnabled AND MouseEnabled)  OR  (TouchEnabled AND MouseEnabled)
+--   Tablet   → TouchEnabled  AND  NOT MouseEnabled  AND  min(vp) >= 600
+--   Mobile   → TouchEnabled  AND  NOT MouseEnabled  AND  min(vp) <  600 (or vp unavailable)
+--
+-- The Desktop rule covers touchscreen laptops/monitors (TouchEnabled=true, MouseEnabled=true).
+-- They must NOT be classified as Mobile.
+
+local UserInputService = game:GetService("UserInputService")
+-- local Root             = script.Parent.Parent
+local Signal           = _Delirium_require("Utilities.Signal")
+local Maid             = _Delirium_require("Core.Maid")
+local ServiceRegistry  = _Delirium_require("Core.ServiceRegistry")
+
+-- ─── Platform constants ───────────────────────────────────────────────────────
+
+local Platform = {
+    Mobile  = "Mobile",
+    Tablet  = "Tablet",
+    Desktop = "Desktop",
+    Console = "Console",
+    Unknown = "Unknown",
+}
+
+-- ─── Module state ─────────────────────────────────────────────────────────────
+
+local _maid     = Maid.new()
+local _platform = Platform.Unknown
+local _viewport = Vector2.new(0, 0)
+local _ready    = false      -- true once viewport.X > 0 and viewport.Y > 0
+
+local _cameraConn = nil      -- current camera's ViewportSize PropertyChanged connection
+
+-- ─── Public API ───────────────────────────────────────────────────────────────
+
+local DeviceDetector = {
+    Platform = Platform,
+
+    -- Fires whenever platform or viewport changes.
+    -- Signature: Changed:Connect(function(platform: string, viewport: Vector2) end)
+    Changed  = Signal.new(),
+}
+
+-- ─── UIS-based classification (camera-independent) ────────────────────────────
+--
+-- Returns a definitive Platform string when UIS signals alone are conclusive.
+-- Returns nil when the device is touch-only and viewport is needed to distinguish
+-- phone vs tablet.
+local function _classifyFromUIS(): string?
+    local touch    = UserInputService.TouchEnabled
+    local mouse    = UserInputService.MouseEnabled
+    local keyboard = UserInputService.KeyboardEnabled
+    local gamepad  = UserInputService.GamepadEnabled
+
+    -- Console: gamepad-primary, no keyboard, no touch
+    if gamepad and not keyboard and not touch then
+        return Platform.Console
+    end
+
+    -- Touchscreen desktop/laptop: both touch AND mouse present → not a phone
+    -- This catches Surface, touchscreen monitors, Windows convertibles, etc.
+    if touch and mouse then
+        return Platform.Desktop
+    end
+
+    -- Standard desktop: keyboard + mouse, no touch
+    if keyboard and mouse and not touch then
+        return Platform.Desktop
+    end
+
+    -- Touch-only (no mouse): could be phone or tablet — need viewport to decide
+    if touch and not mouse then
+        return nil
+    end
+
+    -- Keyboard without mouse (edge case): treat as desktop
+    if keyboard and not mouse then
+        return Platform.Desktop
+    end
+
+    return nil  -- truly ambiguous; caller will use fallback
+end
+
+-- Refines touch-only result into Mobile vs Tablet using the viewport.
+-- Called only when viewport is known valid (X > 0, Y > 0).
+local function _refineTouchDevice(vp: Vector2): string
+    -- Tablet: minimum dimension >= 600px (holds in both portrait and landscape)
+    return math.min(vp.X, vp.Y) >= 600 and Platform.Tablet or Platform.Mobile
+end
+
+-- Full classification combining UIS + viewport.
+local function _classify(vp: Vector2): string
+    local fromUIS = _classifyFromUIS()
+
+    -- Definitive from UIS alone — no need to look at viewport
+    if fromUIS ~= nil then
+        return fromUIS
+    end
+
+    -- Touch-only device: use viewport to decide phone vs tablet
+    if vp.X > 0 and vp.Y > 0 then
+        return _refineTouchDevice(vp)
+    end
+
+    -- Viewport not yet valid: best guess from UIS alone
+    -- TouchEnabled=true, MouseEnabled=false → definitely a touch-only device;
+    -- assume Mobile (safer: smaller window) until viewport confirms tablet.
+    if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+        return Platform.Mobile
+    end
+
+    return Platform.Desktop  -- safe default when nothing else fits
+end
+
+-- ─── Internal update ──────────────────────────────────────────────────────────
+
+local function _update(vp: Vector2, fireChanged: boolean)
+    local newPlatform = _classify(vp)
+    local vpChanged   = (vp.X ~= _viewport.X or vp.Y ~= _viewport.Y)
+    local platChanged = (newPlatform ~= _platform)
+
+    _platform = newPlatform
+    _viewport = vp
+    _ready    = vp.X > 0 and vp.Y > 0
+
+    if fireChanged and (platChanged or vpChanged) then
+        DeviceDetector.Changed:Fire(newPlatform, vp)
+    end
+end
+
+-- ─── Camera wiring ────────────────────────────────────────────────────────────
+
+local function _bindCamera(camera)
+    -- Disconnect previous camera's listener first
+    if _cameraConn then
+        _cameraConn:Disconnect()
+        _cameraConn = nil
+    end
+    if not camera then return end
+
+    -- Immediately evaluate current viewport
+    local vp = camera.ViewportSize
+    _update(vp, true)
+
+    -- Track future viewport changes (orientation flips, window resize, notch adjustments)
+    _cameraConn = camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        _update(camera.ViewportSize, true)
+    end)
+end
+
+local function _wireAll()
+    -- React to the camera object itself being swapped (Roblox can replace it)
+    _maid:GiveTask(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        _bindCamera(workspace.CurrentCamera)
+    end))
+
+    -- Ensure _cameraConn is always disconnected when the Maid cleans up
+    _maid:GiveTask(function()
+        if _cameraConn then
+            _cameraConn:Disconnect()
+            _cameraConn = nil
+        end
+    end)
+
+    -- Initial camera bind (may be nil on very early require)
+    local cam = workspace.CurrentCamera
+    if cam then
+        _bindCamera(cam)
+    else
+        -- Camera not yet available: classify from UIS signals only.
+        -- _update with zero viewport → _classify will use UIS-only path.
+        _update(Vector2.new(0, 0), false)
+        -- The workspace.CurrentCamera PropertyChanged listener above will fire
+        -- when the camera becomes available and trigger a proper re-evaluation.
+    end
+end
+
+_wireAll()
+
+-- ─── Public read API ──────────────────────────────────────────────────────────
+
+--- Returns the current platform string ("Mobile", "Desktop", "Tablet", "Console", "Unknown").
+function DeviceDetector:GetPlatform(): string
+    return _platform
+end
+
+--- Returns the last known valid viewport size.
+--- Returns Vector2(0,0) if viewport has not yet resolved.
+function DeviceDetector:GetViewport(): Vector2
+    return _viewport
+end
+
+--- True once the viewport has a non-zero size (camera available and settled).
+function DeviceDetector:IsViewportReady(): boolean
+    return _ready
+end
+
+--- True for Mobile and Tablet platforms.
+--- Use this as the gate for compact/touch-optimised layouts.
+function DeviceDetector:IsMobile(): boolean
+    return _platform == Platform.Mobile or _platform == Platform.Tablet
+end
+
+--- True for Desktop and Console platforms.
+function DeviceDetector:IsDesktop(): boolean
+    return _platform == Platform.Desktop or _platform == Platform.Console
+end
+
+--- Raw capability check — true if the device has any touch hardware.
+--- Does NOT imply the device is a phone; use IsMobile() for layout decisions.
+function DeviceDetector:IsTouchDevice(): boolean
+    return UserInputService.TouchEnabled
+end
+
+--- Yields the calling coroutine until the viewport is valid (non-zero).
+--- Returns immediately if already ready.
+--- Hard timeout: 3 seconds — returns best-available result regardless.
+--- Safe to call from task.spawn(); do NOT call on the main thread without wrapping.
+function DeviceDetector:WaitForReady(): (string, Vector2)
+    if _ready then
+        return _platform, _viewport
+    end
+
+    local done      = false
+    local conn
+
+    conn = DeviceDetector.Changed:Connect(function(_, vp)
+        if vp.X > 0 and vp.Y > 0 then
+            done = true
+            pcall(function() conn:Disconnect() end)
+        end
+    end)
+
+    -- Bounded wait: check every 50ms, give up after 3s
+    local deadline = os.time() + 3
+    while not done and os.time() < deadline do
+        task.wait(0.05)
+    end
+
+    -- Ensure conn is always cleaned up
+    pcall(function() conn:Disconnect() end)
+
+    -- If timeout fired before viewport resolved, force a re-evaluation
+    if not _ready then
+        local cam = workspace.CurrentCamera
+        if cam then
+            _update(cam.ViewportSize, false)
+        end
+    end
+
+    return _platform, _viewport
+end
+
+-- ─── Reset / lifecycle ────────────────────────────────────────────────────────
+--
+-- Called by ServiceRegistry.ResetAll() during Bootstrap (between execs).
+-- Tears down all camera connections, resets state, and re-initialises cleanly.
+-- Prevents duplicate connections from stacking across Delirium reloads.
+
+function DeviceDetector.Reset()
+    _maid:DoCleaning()
+    _maid     = Maid.new()
+    _platform = Platform.Unknown
+    _viewport = Vector2.new(0, 0)
+    _ready    = false
+    -- Do NOT call Changed:DisconnectAll() here.
+    -- External consumers that subscribed to Changed must survive a Reset() —
+    -- clearing all handlers would silently drop their subscriptions.
+    -- DeviceDetector never subscribes to its own Changed signal, so no
+    -- internal cleanup is needed here.
+    _wireAll()
+end
+
+-- ─── Self-register ────────────────────────────────────────────────────────────
+-- Priority 4: runs before InputAdapter (5) so device state is authoritative
+-- before any system that depends on it initialises.
+
+ServiceRegistry.Register("DeviceDetector", {
+    Reset = DeviceDetector.Reset,
+}, 4)
+
+return DeviceDetector
+
+end
+
 -- ── Utilities.Signal ──────────────────────────────────────
 _Delirium_modules["Utilities.Signal"] = function()
 -- Utilities/Signal.lua
@@ -2604,6 +2906,7 @@ local Maid              = _Delirium_require("Core.Maid")
 local DialogService     = _Delirium_require("Services.DialogService")
 local UnloadService     = _Delirium_require("Services.UnloadService")
 local Tab               = _Delirium_require("Layout.Tab")
+local DeviceDetector    = _Delirium_require("Utilities.DeviceDetector")
 
 local TITLEBAR_H     = 45
 local BUTTON_SIZE    = 28
@@ -2670,20 +2973,17 @@ function Window.new(config: table, parentGui: ScreenGui)
     -- On narrow phones (< 420px wide) the 580px default clips off-screen;
     -- clamp to 94% of viewport while keeping the minimum usable at 320x320.
     local function _responsiveDefaultSize(): UDim2
-        local cam = workspace.CurrentCamera
-        local vp  = cam and cam.ViewportSize or Vector2.new(0, 0)
-        -- P0.1 fix: when camera is nil (very early init or camera swap), the old
-        -- 1920×1080 fallback selected the desktop branch, producing a 580px window
-        -- that exceeds any phone viewport and visually fills the full screen width.
-        -- UserInputService.TouchEnabled is always valid regardless of camera state,
-        -- so use it to pick the safe fallback instead of assuming desktop.
-        if vp.X == 0 or vp.Y == 0 then
-            return UserInputService.TouchEnabled
+        -- DeviceDetector is the single source of truth for viewport + platform state.
+        -- Removes duplicate camera reads from Window.lua; multi-signal fallback logic
+        -- lives in DeviceDetector which evaluates UIS signals regardless of camera.
+        local vp = DeviceDetector:GetViewport()
+        if not DeviceDetector:IsViewportReady() then
+            return DeviceDetector:IsMobile()
                 and UDim2.fromOffset(340, 300)  -- mobile-safe: fits any phone >= 320px wide
                 or  UDim2.fromOffset(580, 380)  -- desktop: original default
         end
         if vp.X < 600 then
-            -- M3 fix: phone-sized viewport — visible margins so the window
+            -- Phone-sized viewport — visible margins so the window
             -- doesn't feel fullscreen. 82% width leaves ~35px margin each side.
             local w = math.clamp(math.floor(vp.X * 0.82), 300, 400)
             local h = math.clamp(math.floor(vp.Y * 0.60), 280, 360)
@@ -2855,21 +3155,20 @@ function Window.new(config: table, parentGui: ScreenGui)
     local isCompact = config.Compact == true or config.Tabs == false or config.NoTabs == true
     self._isCompact = isCompact
 
-    local _navCam   = workspace.CurrentCamera
-    local _navVp    = _navCam and _navCam.ViewportSize or Vector2.new(0, 0)
-    -- P0.1 fix: mirror the camera guard above — when viewport is unavailable
-    -- use TouchEnabled so the nav branch matches the window branch.
-    local _navIsTouch = (_navVp.X == 0 or _navVp.Y == 0)
-        and UserInputService.TouchEnabled
-        or  _navVp.X < 600
-    local SIDENAV_W = isCompact and 0 or (_navIsTouch and 110 or 140)
+    -- DeviceDetector: single authoritative source for mobile/viewport state.
+    -- Mirrors _responsiveDefaultSize() — no duplicate camera reads in Window.lua.
+    local _vp       = DeviceDetector:GetViewport()
+    local _isMobile = DeviceDetector:IsViewportReady()
+        and (_vp.X < 600)
+        or  DeviceDetector:IsMobile()
+    local SIDENAV_W = isCompact and 0 or (_isMobile and 110 or 140)
 
     self.SideNav = ComponentHelper.Create("ScrollingFrame", {
         Name                   = "SideNav",
         Size                   = UDim2.new(0, SIDENAV_W, 1, 0),
         BackgroundTransparency = 1,
         BorderSizePixel        = 0,
-        ScrollBarThickness     = _navIsTouch and 2 or 0,
+        ScrollBarThickness     = _isMobile and 2 or 0,
         Visible                = not isCompact,
         Parent                 = self.ContentContainer,
     })
