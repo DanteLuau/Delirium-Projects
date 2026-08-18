@@ -1,4 +1,4 @@
--- Delirium vstandard  [Delirium.lua]
+-- Delirium v0.3.8  [Delirium.lua]
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -2352,12 +2352,40 @@ end
 _Delirium_modules["Core.VariantEngine"] = function()
 -- Core/VariantEngine.lua
 -- Centralized visual variant system for Delirium components.
--- Immutability contract: VariantEngine.Resolve returns a shallow copy of the variant
--- properties so components cannot accidentally mutate global definitions.
+--
+-- Design contract:
+--   • Resolve()           → shallow copy of layout/sizing props for (componentType, variant).
+--   • ResolveWithTheme()  → Resolve() merged with optional theme-derived props from a
+--                           registered ThemeResolver. Use this when a variant needs to
+--                           produce theme-dependent values (e.g. a future 'Danger' variant
+--                           that pulls from tokens.Error). Components that don't need theme
+--                           overrides continue using Resolve() unchanged — zero cost.
+--   • RegisterVariant()   → extend the variant table at runtime without editing this file.
+--   • HasComponent() / HasVariant() → cheap pre-validation for callers.
+--   • RegisterVariantThemeResolver() → attach a (tokens) -> props function to any variant;
+--                                      called lazily by ResolveWithTheme().
+--
+-- Immutability contract: every Resolve / ResolveWithTheme call returns a fresh shallow
+-- copy so components cannot accidentally mutate global definitions.
+--
+-- Lifecycle: Reset() clears custom registrations and theme resolvers so repeated
+-- executions start clean. Built-in VARIANTS are never wiped.
+
+-- ─── Luau type exports ───────────────────────────────────────────────────────
+-- These are used for documentation and strict-mode tooling.
+-- They are not enforced at runtime in executor environments.
+
+export type VariantProps       = {[string]: any}          -- layout/sizing/flag values
+export type VariantMap         = {[string]: VariantProps}  -- variantName → props
+export type ComponentVariantMap= {[string]: VariantMap}   -- componentType → variants
+export type ThemeResolverFn    = (tokens: {[string]: Color3}) -> VariantProps
+
+-- ─── Engine state ─────────────────────────────────────────────────────────────
 
 local VariantEngine = {}
 
-local VARIANTS = {
+-- Built-in variant definitions.  Never cleared by Reset().
+local VARIANTS: ComponentVariantMap = {
     Button = {
         Default = {
             Height     = 40,
@@ -2545,45 +2573,238 @@ local VARIANTS = {
     },
 }
 
-local function shallowCopy(tbl: table): table
-    local copy = {}
+-- Custom variants registered at runtime via RegisterVariant().
+-- Separate from VARIANTS so Reset() can wipe custom entries without touching builtins.
+-- Key format: "ComponentType:VariantName"
+local _customKeys: {[string]: boolean} = {}
+
+-- Theme resolver functions: _THEME_RESOLVERS[componentType][variantName] = fn(tokens)->props
+-- Merged on top of Resolve() output by ResolveWithTheme(). Cleared by Reset().
+local _THEME_RESOLVERS: {[string]: {[string]: ThemeResolverFn}} = {}
+
+-- ─── Internal helpers ─────────────────────────────────────────────────────────────
+
+local function shallowCopy(tbl: VariantProps): VariantProps
+    local copy: VariantProps = {}
     for k, v in pairs(tbl) do
         copy[k] = v
     end
     return copy
 end
 
-function VariantEngine.Resolve(componentType: string, variantName: string?): table
+local function _resolveDef(componentType: string, variantName: string?): VariantProps?
+    local compDef = VARIANTS[componentType]
+    if not compDef then return nil end
+
+    if variantName == nil or variantName == "" or variantName == "Default" then
+        return compDef.Default
+    end
+
+    return compDef[variantName] or nil
+end
+
+-- ─── Core resolution API ───────────────────────────────────────────────────────────
+
+-- Resolve layout/sizing props for a component variant.
+-- • variantName = nil / "" / "Default" → returns Default props.
+-- • Unknown variantName → warns + returns Default (never crashes).
+-- • Unknown componentType → warns + returns {}.
+-- Returns a shallow copy so mutations are local to the caller.
+function VariantEngine.Resolve(componentType: string, variantName: string?): VariantProps
     local compDef = VARIANTS[componentType]
     if not compDef then
         warn("[Delirium VariantEngine] Unknown component type: " .. tostring(componentType))
         return {}
     end
 
-    if variantName == nil or variantName == "" or variantName == "Default" then
-        return shallowCopy(compDef.Default)
-    end
+    local normalised = (variantName == nil or variantName == "") and "Default" or variantName
 
-    local style = compDef[variantName]
+    local style = compDef[normalised]
     if not style then
-        warn(string.format("[Delirium VariantEngine] Unknown variant '%s' for %s; falling back to Default", tostring(variantName), componentType))
-        return shallowCopy(compDef.Default)
+        warn(string.format(
+            "[Delirium VariantEngine] Unknown variant '%s' for '%s'; falling back to Default",
+            tostring(variantName), componentType
+        ))
+        style = compDef.Default
     end
 
     return shallowCopy(style)
 end
 
-function VariantEngine.GetVariantNames(componentType: string): table
+-- Resolve layout props AND merge any registered theme-derived props on top.
+-- • Identical to Resolve() when no ThemeResolver is registered for this variant.
+-- • Requires ThemeEngine to be accessible; when tokens cannot be fetched (e.g.
+--   ThemeEngine not yet loaded) falls back gracefully to Resolve()-only output.
+-- Components that never need theme overrides should continue using Resolve().
+function VariantEngine.ResolveWithTheme(componentType: string, variantName: string?): VariantProps
+    local base = VariantEngine.Resolve(componentType, variantName)
+
+    local compResolvers = _THEME_RESOLVERS[componentType]
+    if not compResolvers then return base end
+
+    local normalised = (variantName == nil or variantName == "") and "Default" or variantName
+    local resolverFn = compResolvers[normalised]
+    if not resolverFn then return base end
+
+    -- Attempt to fetch current theme tokens; fail gracefully if ThemeEngine unavailable.
+    local ok, tokens = pcall(function()
+        local ThemeEngine = _Delirium_require("Core.ThemeEngine")
+        return ThemeEngine.GetTokens()
+    end)
+
+    if not ok or not tokens then return base end
+
+    -- Merge theme-derived props onto the base copy (theme props win on key collision).
+    local okMerge, extraProps = pcall(resolverFn, tokens)
+    if not okMerge or type(extraProps) ~= "table" then
+        warn(string.format(
+            "[Delirium VariantEngine] ThemeResolver for '%s/%s' errored: %s",
+            componentType, tostring(variantName), tostring(extraProps)
+        ))
+        return base
+    end
+
+    for k, v in pairs(extraProps) do
+        base[k] = v
+    end
+    return base
+end
+
+-- ─── Query API ──────────────────────────────────────────────────────────────────
+
+-- Returns true when the component type has any registered variants (built-in or custom).
+function VariantEngine.HasComponent(componentType: string): boolean
+    return VARIANTS[componentType] ~= nil
+end
+
+-- Returns true when the specific variant exists for the component type.
+-- "Default" always returns true for any registered component type.
+function VariantEngine.HasVariant(componentType: string, variantName: string): boolean
+    local compDef = VARIANTS[componentType]
+    if not compDef then return false end
+    return compDef[variantName] ~= nil
+end
+
+-- Returns a sorted list of known variant names for a component type.
+function VariantEngine.GetVariantNames(componentType: string): {string}
     local compDef = VARIANTS[componentType]
     if not compDef then return {} end
 
-    local names = {}
+    local names: {string} = {}
     for name in pairs(compDef) do
         table.insert(names, name)
     end
     table.sort(names)
     return names
 end
+
+-- Returns a sorted list of all registered component type names.
+function VariantEngine.GetComponentNames(): {string}
+    local names: {string} = {}
+    for name in pairs(VARIANTS) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+-- ─── Extension API ────────────────────────────────────────────────────────────────
+
+-- Register a custom variant (or override an existing one) at runtime.
+-- • componentType must already exist (cannot create new component types here).
+-- • variantName "Default" may be overridden if explicitly intended.
+-- • props must be a non-empty table.
+-- Custom variants are tracked separately so Reset() can clear them without
+-- touching built-in definitions.
+function VariantEngine.RegisterVariant(
+    componentType: string,
+    variantName: string,
+    props: VariantProps
+)
+    assert(type(componentType) == "string" and #componentType > 0,
+        "[VariantEngine.RegisterVariant] componentType must be a non-empty string")
+    assert(type(variantName) == "string" and #variantName > 0,
+        "[VariantEngine.RegisterVariant] variantName must be a non-empty string")
+    assert(type(props) == "table",
+        "[VariantEngine.RegisterVariant] props must be a table")
+
+    if not VARIANTS[componentType] then
+        warn(string.format(
+            "[Delirium VariantEngine] RegisterVariant: unknown component type '%s'",
+            componentType
+        ))
+        return
+    end
+
+    VARIANTS[componentType][variantName] = shallowCopy(props)
+    _customKeys[componentType .. ":" .. variantName] = true
+end
+
+-- Attach a theme-resolver function to a variant.
+-- fn(tokens) is called by ResolveWithTheme() and its return table is merged
+-- onto the base variant props. Useful for variants that need to produce
+-- theme-dependent values (colors, derived sizes) without hardcoding them.
+-- • componentType and variantName must exist at registration time.
+-- • fn must be a function; bad fn errors are caught at resolve-time, not here.
+-- Theme resolvers are cleared by Reset() (same lifecycle as custom variants).
+function VariantEngine.RegisterVariantThemeResolver(
+    componentType: string,
+    variantName: string,
+    fn: ThemeResolverFn
+)
+    assert(type(componentType) == "string" and #componentType > 0,
+        "[VariantEngine.RegisterVariantThemeResolver] componentType must be non-empty string")
+    assert(type(variantName) == "string" and #variantName > 0,
+        "[VariantEngine.RegisterVariantThemeResolver] variantName must be non-empty string")
+    assert(type(fn) == "function",
+        "[VariantEngine.RegisterVariantThemeResolver] fn must be a function")
+
+    if not VariantEngine.HasComponent(componentType) then
+        warn(string.format(
+            "[Delirium VariantEngine] RegisterVariantThemeResolver: unknown component type '%s'",
+            componentType
+        ))
+        return
+    end
+
+    if not _THEME_RESOLVERS[componentType] then
+        _THEME_RESOLVERS[componentType] = {}
+    end
+    _THEME_RESOLVERS[componentType][variantName] = fn
+end
+
+-- ─── Lifecycle ────────────────────────────────────────────────────────────────────
+
+-- Remove all custom-registered variants and all theme resolvers.
+-- Built-in VARIANTS entries are never touched.
+-- Called by ServiceRegistry on session teardown / re-execution.
+local function Reset()
+    -- Remove custom variant entries from VARIANTS
+    for key in pairs(_customKeys) do
+        local sep = string.find(key, ":", 1, true)
+        if sep then
+            local compType   = string.sub(key, 1, sep - 1)
+            local varName    = string.sub(key, sep + 1)
+            if VARIANTS[compType] then
+                VARIANTS[compType][varName] = nil
+            end
+        end
+    end
+    table.clear(_customKeys)
+
+    -- Clear all theme resolvers
+    table.clear(_THEME_RESOLVERS)
+end
+
+-- ─── Self-register ────────────────────────────────────────────────────────────────
+
+local ServiceRegistry = _Delirium_require("Core.ServiceRegistry")
+
+ServiceRegistry.Register("VariantEngine", {
+    Reset = Reset,
+    -- No Init: VariantEngine does not need the ScreenGui.
+}, 9)  -- priority 9 — resets just before ThemeEngine (10) so ThemeEngine listeners
+       -- don't fire against stale resolvers during the same teardown cycle.
 
 return VariantEngine
 
@@ -5281,6 +5502,7 @@ function ColorPicker.New(parent: Instance, config: table, debugId: string?)
     local currentColor = config.Default or Color3.fromRGB(100, 180, 255)
     local alpha        = type(config.Alpha) == "number" and math.clamp(config.Alpha, 0, 1) or 1
     local enabled      = true
+    local _destroyed   = false
     local isOpen       = false
 
     local h, s, v = toHSV(currentColor)
@@ -5833,6 +6055,8 @@ function ColorPicker.New(parent: Instance, config: table, debugId: string?)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         resetGesture()
         themeDisconnect()
         for _, conn in ipairs(globalConns) do conn:Disconnect() end
@@ -5971,6 +6195,7 @@ function Divider.New(parent: Instance, config: table)
 
     -- ─── Public API ──────────────────────────────────────────────────────────
 
+    local _destroyed = false
     local api = {}
 
     function api:SetLabel(text: string)
@@ -5981,6 +6206,8 @@ function Divider.New(parent: Instance, config: table)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         themeDisconnect()
         frame:Destroy()
     end
@@ -6662,6 +6889,7 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     local desc       = config.Description or ""
     local currentKey = config.Default     or Enum.KeyCode.E
     local enabled    = true
+    local _destroyed  = false
     local isListening = false
 
     local OnChanged   = Signal.new()
@@ -6905,6 +7133,8 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         if globalConn then globalConn:Disconnect() end
         if timeoutThread then pcall(task.cancel, timeoutThread) end
         _activateConn:Disconnect()
@@ -7025,6 +7255,7 @@ function Label.New(parent: Instance, config: table)
 
     -- ─── Public API ──────────────────────────────────────────────────────────
 
+    local _destroyed = false
     local api = {}
 
     function api:SetTitle(text: string)
@@ -7057,6 +7288,8 @@ function Label.New(parent: Instance, config: table)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         themeDisconnect()
         frame:Destroy()
     end
@@ -7227,6 +7460,7 @@ function Paragraph.New(parent: Instance, config: table)
 
     -- ─── Public API ──────────────────────────────────────────────────────────
 
+    local _destroyed = false
     local api = {}
 
     function api:SetTitle(text: string)
@@ -7249,6 +7483,8 @@ function Paragraph.New(parent: Instance, config: table)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         themeDisconnect()
         frame:Destroy()
     end
@@ -7288,9 +7524,27 @@ local Slider = {}
 -- P3: gesture threshold replaced by InputAdapter.GESTURE_THRESHOLD (= 10, same value).
 local HORIZONTAL_DOMINANCE = 1.8 -- dx must be this many times dy to confirm horizontal intent (slider-specific)
 
+-- Fallback defaults for Slider style props.
+-- Guards against stale VariantEngine caches (executor reuse across sessions)
+-- or consumer-registered variants missing one of these keys.
+local SLIDER_STYLE_DEFAULTS = {
+    Height = 50,
+    Corner = 8,
+    PadTop = 8,
+    PadBot = 8,
+    PadL   = 12,
+    PadR   = 12,
+    TrackH = 6,
+}
+
 function Slider.New(parent: Instance, config: table, debugId: string?)
     config = config or {}
     local style = VariantEngine.Resolve("Slider", config.Variant)
+    -- Defensive fill: if Resolve returned an incomplete table (stale cache,
+    -- bad RegisterVariant call, etc.) ensure every layout key has a safe value.
+    for _k, _v in pairs(SLIDER_STYLE_DEFAULTS) do
+        if style[_k] == nil then style[_k] = _v end
+    end
 
     -- P1.1: normalize range defensively. Never divide by zero → NaN.
     local min = tonumber(config.Min) or 0
@@ -7302,6 +7556,7 @@ function Slider.New(parent: Instance, config: table, debugId: string?)
         or 0
     local callback  = config.Callback  or function() end
     local enabled   = true
+    local _destroyed = false
     local value     = math.clamp(tonumber(config.Default) or min, min, max)
 
     -- ─── Frames ────────────────────────────────────────────────────────────
@@ -7598,6 +7853,8 @@ function Slider.New(parent: Instance, config: table, debugId: string?)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         resetGesture()
         themeDisconnect()
         for _, conn in ipairs(globalConns) do conn:Disconnect() end
@@ -7640,6 +7897,7 @@ function TextBox.New(parent: Instance, config: table, debugId: string?)
     local placeholder = config.Placeholder  or "Type here..."
     local defaultText = config.Default      or ""
     local enabled     = true
+    local _destroyed  = false
 
     local OnChanged = Signal.new()
     local OnSubmit  = Signal.new()
@@ -8099,6 +8357,8 @@ function TextBox.New(parent: Instance, config: table, debugId: string?)
     function api:Hide()  Row.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         _closeEditor(false)   -- dismiss expanded editor if open
         themeDisconnect()
         OnChanged:Destroy()
@@ -8138,6 +8398,7 @@ function Toggle.New(parent: Instance, config: table, debugId: string?)
     local baseH    = hasDesc and style.HeightDesc or style.Height
     local state    = config.Default == true
     local enabled  = true
+    local _destroyed = false
 
     -- ─── Frames ────────────────────────────────────────────────────────────
 
@@ -8324,6 +8585,8 @@ function Toggle.New(parent: Instance, config: table, debugId: string?)
     function api:Hide()  frame.Visible = false end
 
     function api:Destroy()
+        if _destroyed then return end
+        _destroyed = true
         themeDisconnect()
         OnChanged:Destroy()
         frame:Destroy()
@@ -9944,6 +10207,7 @@ local ServiceRegistry     = _Delirium_require("Core.ServiceRegistry")
 
 local Runtime             = _Delirium_require("Core.Runtime")
 local ThemeEngine         = _Delirium_require("Core.ThemeEngine")
+local VariantEngine       = _Delirium_require("Core.VariantEngine")
 local AnimationEngine     = _Delirium_require("Core.AnimationEngine")
 local NotificationService = _Delirium_require("Services.NotificationService")
 local DialogService       = _Delirium_require("Services.DialogService")
@@ -9958,7 +10222,7 @@ local GUI_NAME    = "DeliriumUI"
 -- ─── Public API Declaration ────────────────────────────────────────────────
 -- Declared at file top-level so Delirium is never nil during execution
 
-local Delirium = { Version = "standard" }
+local Delirium = { Version = "0.3.8" }
 
 -- ─── State ─────────────────────────────────────────────────────────────────
 
@@ -10020,9 +10284,7 @@ end
 -- ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 local function Bootstrap()
-    -- Step 1: Destroy previous Runtime first (cascade: Window → Tab → Section
-    -- → Component). This runs before GUI teardown so the old runtime's windows
-    -- can clean up their own instances/connections while they still exist.
+    print("[Delirium Engine] Bootstrap Step 1: Cleaning previous runtime...")
     local envG = (type(getgenv) == "function" and getgenv()) or _G or {}
     local existing = envG[RUNTIME_KEY]
     if existing and type(existing) == "table" then
@@ -10035,13 +10297,13 @@ local function Bootstrap()
         envG[RUNTIME_KEY] = nil
     end
 
-    -- Step 2: Hard reset all services regardless of path above
+    print("[Delirium Engine] Bootstrap Step 2: Resetting services...")
     ServiceRegistry.ResetAll()
 
-    -- Step 3: Remove any orphan GUI left behind (after runtime/service teardown)
+    print("[Delirium Engine] Bootstrap Step 3: Nuking orphan GUI...")
     _nukeExistingGui()
 
-    -- Step 4: Create new Runtime + GUI
+    print("[Delirium Engine] Bootstrap Step 4: Creating ScreenGui & Runtime...")
     local gui     = _createGui()
     local runtime = Runtime.new()
 
@@ -10053,12 +10315,13 @@ local function Bootstrap()
     _runtime = runtime
     _gui     = gui
 
-    -- Step 5: Initialize UnloadService and all services with ScreenGui & Runtime
+    print("[Delirium Engine] Bootstrap Step 5: Initializing services...")
     UnloadService.Init(gui, runtime)
     ServiceRegistry.InitAll(gui)
 
     runtime.PublicApi = Delirium
 
+    print("[Delirium Engine] Bootstrap complete!")
     return runtime, gui
 end
 
@@ -10123,6 +10386,7 @@ end
 
 -- Expose sub-modules for advanced use
 Delirium.Theme     = ThemeEngine
+Delirium.Variants  = VariantEngine   -- variant foundation (TASK 01)
 Delirium.Animation = AnimationEngine
 Delirium.Dialog    = DialogService
 Delirium.UnloadSvc = UnloadService
