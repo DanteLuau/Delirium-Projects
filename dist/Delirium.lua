@@ -1,4 +1,4 @@
--- Delirium v0.3.9  [Delirium.lua]
+-- Delirium v0.3.11  [Delirium.lua]
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -770,6 +770,22 @@ function Signal:Fire(...)
     local args = { ... }
     for _, handler in ipairs(self._handlers) do
         if handler.connected then
+            local ok, err = pcall(handler.fn, table.unpack(args))
+            if not ok then
+                warn("[Signal] handler error: " .. tostring(err))
+            end
+        end
+    end
+end
+
+-- Async variant: each handler is spawned in its own task.
+-- No ordering guarantee and no error propagation back to the caller.
+-- Use when handlers may yield or when fire-and-forget async behaviour is needed.
+function Signal:FireDeferred(...)
+    if not self._handlers then return end
+    local args = { ... }
+    for _, handler in ipairs(self._handlers) do
+        if handler.connected then
             task.spawn(handler.fn, table.unpack(args))
         end
     end
@@ -1408,6 +1424,7 @@ local UserInputService = game:GetService("UserInputService")
 local GuiService       = game:GetService("GuiService")
 local Signal           = _Delirium_require("Utilities.Signal")
 local Maid             = _Delirium_require("Core.Maid")
+local DeviceDetector   = _Delirium_require("Utilities.DeviceDetector")
 
 -- ─── Enums ───────────────────────────────────────────────────────────────────
 
@@ -1427,16 +1444,18 @@ local InputMode = {
 
 -- ─── Internal helpers ─────────────────────────────────────────────────────────
 
+-- Map DeviceDetector platform strings to InputAdapter DeviceType strings.
+-- DeviceDetector is the single authoritative source for platform classification;
+-- InputAdapter delegates here instead of duplicating UIS + viewport detection logic.
+local _platformMap = {
+    [DeviceDetector.Platform.Mobile]  = DeviceType.Phone,
+    [DeviceDetector.Platform.Tablet]  = DeviceType.Tablet,
+    [DeviceDetector.Platform.Desktop] = DeviceType.Desktop,
+    [DeviceDetector.Platform.Console] = DeviceType.Console,
+}
+
 local function classifyDevice(): string
-    if UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
-        return DeviceType.Console
-    end
-    if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
-        local camera   = workspace.CurrentCamera
-        local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
-        return math.min(viewport.X, viewport.Y) >= 600 and DeviceType.Tablet or DeviceType.Phone
-    end
-    return DeviceType.Desktop
+    return _platformMap[DeviceDetector:GetPlatform()] or DeviceType.Desktop
 end
 
 local function classifyInputMode(inputType: Enum.UserInputType): string
@@ -1543,6 +1562,19 @@ local function _wireConnections()
             if newMode ~= InputAdapter.CurrentInputMode then
                 InputAdapter.CurrentInputMode = newMode
                 InputAdapter.InputModeChanged:Fire(newMode)
+            end
+        end)
+    )
+
+    -- Device type sync: when DeviceDetector reclassifies the platform (viewport
+    -- change, orientation flip, camera swap), update InputAdapter flags to match.
+    -- Single source of truth: no duplicate UIS/viewport detection here.
+    _maid:GiveTask(
+        DeviceDetector.Changed:Connect(function(platform, _vp)
+            local newDevice = _platformMap[platform] or DeviceType.Desktop
+            if newDevice ~= InputAdapter.CurrentDevice then
+                InputAdapter.CurrentDevice = newDevice
+                _updateFlags()
             end
         end)
     )
@@ -1873,6 +1905,19 @@ end
 
 -- Alias
 Maid.Destroy = Maid.DoCleaning
+
+-- Schedule fn to run after `seconds`. The pending thread is registered with the
+-- Maid so DoCleaning() cancels it before it fires — prevents callbacks running
+-- on components that have already been destroyed.
+-- If the Maid has already been cleaned, GiveTask() immediately invokes the
+-- cancel closure, which is a safe no-op because thread is assigned before GiveTask.
+function Maid:Delay(seconds: number, fn: () -> ())
+    local thread
+    thread = task.delay(seconds, fn)
+    self:GiveTask(function()
+        pcall(task.cancel, thread)
+    end)
+end
 
 return Maid
 
@@ -4443,14 +4488,10 @@ function Window:_EnableDragging()
             startPos.X.Offset + delta.X,
             startPos.Y.Offset + delta.Y
         )
-        -- BUG-04 fix: key="drag" ensures AnimationEngine cancels the previous
-        -- in-flight tween before starting a new one. Without this, rapid touch
-        -- updates (60fps) stack hundreds of 0.04s tweens that fight each other,
-        -- causing rubber-band jitter on mobile.
-        AnimationEngine.Play(self.MainFrame,
-            TweenInfo.new(0.04, Enum.EasingStyle.Linear),
-            { Position = newPos },
-            "drag")
+        -- Direct assignment: zero tween overhead, zero latency, frame-perfect.
+        -- Tween-per-InputChanged stacked hundreds of 0.04s tweens at 60fps (BUG-04);
+        -- direct assign eliminates the AnimationEngine round-trip entirely.
+        self.MainFrame.Position = newPos
     end))
 
     self._maid:GiveTask(UserInputService.InputEnded:Connect(function(input)
@@ -7090,6 +7131,11 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     local touchBtnStroke   = nil
     local _isPlacementMode = false
     local _touchConns      = {}
+    -- Whether the floating TouchButton is actively shown.
+    -- Starts false — only visible after user explicitly enables it via BindBtn.
+    local _touchEnabled    = false
+    -- Lazy-build guard: TouchButton DOM is created only the first time it is needed.
+    local _touchBtnBuilt   = false
 
     local function _clearTouchConns()
         for _, c in ipairs(_touchConns) do c:Disconnect() end
@@ -7135,100 +7181,110 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     end
 
     local function _buildTouchButton()
-        -- Defer one frame so Row is fully in the hierarchy before we walk up.
-        task.defer(function()
-            if _destroyed then return end
+        -- Called from ensureTouchButton(), which is only reachable via BindBtn tap or
+        -- SetTouchButtonVisible() — both happen after Row is fully parented. Build sync.
+        if _destroyed then return end
+        local screenGui = _findScreenGui(Row)
+        if not screenGui then
+            warn("Keybind (" .. title .. "): ScreenGui ancestor not found — TouchButton skipped")
+            return
+        end
 
-            local screenGui = _findScreenGui(Row)
-            if not screenGui then
-                warn("Keybind (" .. title .. "): ScreenGui ancestor not found — TouchButton skipped")
-                return
-            end
+        local initPos = _loadTouchPos()
 
-            local initPos = _loadTouchPos()
+        TouchButton = ComponentHelper.Create("TextButton", {
+            Name             = "KeybindTouch_" .. title,
+            Position         = UDim2.fromOffset(initPos.X, initPos.Y),
+            Size             = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
+            BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
+            Text             = currentKey.Name:sub(1, 4),
+            TextColor3       = ThemeEngine.GetToken("Text"),
+            TextSize         = 13,
+            Font             = Enum.Font.GothamBold,
+            AutoButtonColor  = false,
+            ZIndex           = 20,
+            Visible          = false,  -- hidden until user enables via BindBtn
+            Parent           = screenGui,
+        })
+        ComponentHelper.AddCorner(TouchButton, 10)
+        touchBtnStroke = ComponentHelper.AddStroke(
+            TouchButton, ThemeEngine.GetToken("Border"), 1.5
+        )
 
-            TouchButton = ComponentHelper.Create("TextButton", {
-                Name             = "KeybindTouch_" .. title,
-                Position         = UDim2.fromOffset(initPos.X, initPos.Y),
-                Size             = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
-                BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
-                Text             = currentKey.Name:sub(1, 4),
-                TextColor3       = ThemeEngine.GetToken("Text"),
-                TextSize         = 13,
-                Font             = Enum.Font.GothamBold,
-                AutoButtonColor  = false,
-                ZIndex           = 20,
-                Visible          = Row.Visible,
-                Parent           = screenGui,
-            })
-            ComponentHelper.AddCorner(TouchButton, 10)
-            touchBtnStroke = ComponentHelper.AddStroke(
-                TouchButton, ThemeEngine.GetToken("Border"), 1.5
+        -- Press scale feedback.
+        local function _animPress()
+            TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X - 6, TOUCH_BTN_SIZE.Y - 6),
+            }, "touch_press")
+        end
+        local function _animRelease()
+            TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
+            }, "touch_press")
+        end
+
+        -- Per-touch state.
+        local _activeDragInput = nil  -- InputObject that owns the current drag
+        local _dragStart       = nil
+        local _btnStartPos     = nil
+        local _wasDragged      = false
+
+        _addTouchConn(TouchButton.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if _activeDragInput ~= nil then return end  -- another touch already owns the drag
+            -- Claim this InputObject as the owner of the current drag.
+            _activeDragInput = input
+            _dragStart       = InputAdapter.GetPointerPosition(input)
+            _btnStartPos     = Vector2.new(
+                TouchButton.Position.X.Offset,
+                TouchButton.Position.Y.Offset
             )
+            _wasDragged = false
+            if not _isPlacementMode then _animPress() end
+        end))
 
-            -- Press scale feedback.
-            local function _animPress()
-                TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
-                    Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X - 6, TOUCH_BTN_SIZE.Y - 6),
-                }, "touch_press")
+        -- Use global UIS.InputChanged instead of GuiObject.InputChanged.
+        -- GuiObject events stop firing when the finger leaves the button bounds;
+        -- global UIS tracks the same InputObject for its entire lifetime.
+        _addTouchConn(UserInputService.InputChanged:Connect(function(input)
+            if input ~= _activeDragInput then return end  -- wrong touch, ignore
+            if not _dragStart or not _btnStartPos then return end
+            local delta = InputAdapter.GetPointerPosition(input) - _dragStart
+            if delta.Magnitude > InputAdapter.DRAG_THRESHOLD_TOUCH then
+                _wasDragged = true
             end
-            local function _animRelease()
-                TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
-                    Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
-                }, "touch_press")
+            -- Only reposition during placement mode.
+            if _isPlacementMode and _wasDragged then
+                local newPos = _clampPosition(_btnStartPos + delta, TOUCH_BTN_SIZE)
+                TouchButton.Position = UDim2.fromOffset(newPos.X, newPos.Y)
             end
+        end))
 
-            -- Per-touch state.
-            local _dragStart   = nil
-            local _btnStartPos = nil
-            local _wasDragged  = false
-
-            _addTouchConn(TouchButton.InputBegan:Connect(function(input)
-                if input.UserInputType ~= Enum.UserInputType.Touch then return end
-                _dragStart   = InputAdapter.GetPointerPosition(input)
-                _btnStartPos = Vector2.new(
-                    TouchButton.Position.X.Offset,
-                    TouchButton.Position.Y.Offset
-                )
-                _wasDragged = false
-                if not _isPlacementMode then _animPress() end
-            end))
-
-            _addTouchConn(TouchButton.InputChanged:Connect(function(input)
-                if input.UserInputType ~= Enum.UserInputType.Touch then return end
-                if not _dragStart or not _btnStartPos then return end
-                local delta = InputAdapter.GetPointerPosition(input) - _dragStart
-                if delta.Magnitude > InputAdapter.DRAG_THRESHOLD_TOUCH then
-                    _wasDragged = true
+        _addTouchConn(TouchButton.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if input ~= _activeDragInput then return end  -- not our touch, ignore
+            _animRelease()
+            if _isPlacementMode then
+                -- Position is saved when the user exits placement mode via BindBtn.
+                -- No disk write here — avoids repeated writefile on every finger-lift.
+            else
+                -- Normal mode: clean tap fires OnActivated.
+                if not _wasDragged and enabled then
+                    OnActivated:Fire(currentKey)
                 end
-                -- Only reposition during placement mode.
-                if _isPlacementMode and _wasDragged then
-                    local newPos = _clampPosition(_btnStartPos + delta, TOUCH_BTN_SIZE)
-                    TouchButton.Position = UDim2.fromOffset(newPos.X, newPos.Y)
-                end
-            end))
+            end
+            _activeDragInput = nil
+            _dragStart       = nil
+            _btnStartPos     = nil
+            _wasDragged      = false
+        end))
+    end
 
-            _addTouchConn(TouchButton.InputEnded:Connect(function(input)
-                if input.UserInputType ~= Enum.UserInputType.Touch then return end
-                _animRelease()
-                if _isPlacementMode then
-                    -- Persist wherever the button landed (tap or drag).
-                    local pos = Vector2.new(
-                        TouchButton.Position.X.Offset,
-                        TouchButton.Position.Y.Offset
-                    )
-                    _saveTouchPos(pos)
-                else
-                    -- Normal mode: clean tap fires OnActivated.
-                    if not _wasDragged and enabled then
-                        OnActivated:Fire(currentKey)
-                    end
-                end
-                _dragStart   = nil
-                _btnStartPos = nil
-                _wasDragged  = false
-            end))
-        end)
+    -- Lazily build the TouchButton the first time it is needed.
+    local function ensureTouchButton()
+        if _touchBtnBuilt then return end
+        _touchBtnBuilt = true
+        _buildTouchButton()
     end
 
     -- ─── BindBtn click — unified handler ──────────────────────────────────
@@ -7237,10 +7293,27 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         if not enabled then return end
 
         if InputAdapter.IsTouch then
-            -- Mobile: toggle placement mode instead of keyboard listen.
+            -- Lazy-build on first tap so DOM stays clean until actually needed.
+            ensureTouchButton()
+            if not TouchButton then return end
+
             if _isPlacementMode then
+                -- Currently dragging — lock position and save.
                 _exitPlacementMode()
+            elseif _touchEnabled then
+                -- Button is visible but not in placement mode → toggle it off.
+                _touchEnabled          = false
+                TouchButton.Visible    = false
+                BindBtn.Text           = keyDisplayName()
+                BindBtn.TextColor3     = ThemeEngine.GetToken("Text")
+                TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
+                    Color = ThemeEngine.GetToken("Border"),
+                })
             else
+                -- Button is hidden → enable and immediately enter placement mode
+                -- so the user can position it before use.
+                _touchEnabled       = true
+                TouchButton.Visible = true
                 _enterPlacementMode()
             end
             return
@@ -7283,10 +7356,7 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         end)
     end)
 
-    -- Build touch button on mobile.
-    if InputAdapter.IsTouch then
-        _buildTouchButton()
-    end
+    -- TouchButton is built lazily on first BindBtn tap (see ensureTouchButton).
 
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
@@ -7379,13 +7449,33 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
 
     function api:Show()
         Row.Visible = true
-        if TouchButton then TouchButton.Visible = true end
+        -- Only restore TouchButton visibility if it was enabled by the user.
+        if TouchButton and _touchEnabled then TouchButton.Visible = true end
     end
 
     function api:Hide()
         Row.Visible = false
         if TouchButton then TouchButton.Visible = false end
     end
+
+    -- Toggle the floating TouchButton from external callers (e.g. a Settings toggle).
+    function api:SetTouchButtonVisible(visible: boolean)
+        if not InputAdapter.IsTouch then return end
+        ensureTouchButton()
+        if not TouchButton then return end
+        _touchEnabled       = visible == true
+        TouchButton.Visible = _touchEnabled
+        if not _touchEnabled and _isPlacementMode then
+            _exitPlacementMode()
+        end
+    end
+
+    function api:IsTouchButtonVisible(): boolean
+        return _touchEnabled and TouchButton ~= nil and TouchButton.Visible
+    end
+
+    -- Convenience alias.
+    api.SetTouchEnabled = api.SetTouchButtonVisible
 
     function api:Destroy()
         if _destroyed then return end
@@ -9411,8 +9501,14 @@ function ConfigService.DeleteProfile(name: string): boolean
     _profiles[name] = nil  -- evict cache regardless of disk outcome
 
     -- File already absent → already deleted. Deterministic across executors.
-    if type(isfile) == "function" and not pcall(isfile, path) then
-        return true
+    -- pcall(isfile, path) returns (ok, result): ok=true means isfile ran without
+    -- error and result is whether the file exists. We must check BOTH: not ok means
+    -- isfile itself errored (executor missing the API?), not that the file is absent.
+    if type(isfile) == "function" then
+        local ok, exists = pcall(isfile, path)
+        if ok and not exists then
+            return true  -- file not present; nothing to delete
+        end
     end
 
     local ok, err = pcall(delfile, path)
@@ -10694,7 +10790,7 @@ local GUI_NAME    = "DeliriumUI"
 -- ─── Public API Declaration ────────────────────────────────────────────────
 -- Declared at file top-level so Delirium is never nil during execution
 
-local Delirium = { Version = "0.3.9" }
+local Delirium = { Version = "0.3.11" }
 
 -- ─── State ─────────────────────────────────────────────────────────────────
 
