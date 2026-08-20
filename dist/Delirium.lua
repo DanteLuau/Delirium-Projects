@@ -3868,7 +3868,7 @@ function Window.new(config: table, parentGui: ScreenGui)
         Parent            = parentGui,
     })
     ComponentHelper.AddCorner(self.MainFrame, 10)
-    local mainStroke = ComponentHelper.AddStroke(self.MainFrame, ThemeEngine.GetToken("Border"), 1)
+    self._mainStroke = ComponentHelper.AddStroke(self.MainFrame, ThemeEngine.GetToken("Border"), 1)
 
     -- ─── Overlay layer ────────────────────────────────────────────────────
     -- A transparent Frame that lives as a sibling of MainFrame in the ScreenGui.
@@ -4112,7 +4112,7 @@ function Window.new(config: table, parentGui: ScreenGui)
 
     self._maid:GiveTask(ThemeEngine.OnThemeChanged(function(tokens)
         TweenHelper.Tween(self.MainFrame,  nil, { BackgroundColor3 = tokens.Background })
-        TweenHelper.Tween(mainStroke,      nil, { Color            = tokens.Border     })
+        TweenHelper.Tween(self._mainStroke, nil, { Color            = tokens.Border     })
         TweenHelper.Tween(self.TitleLabel, nil, { TextColor3       = tokens.Text       })
 
         local err = tokens.Error or Color3.fromRGB(220, 60, 60)
@@ -4201,7 +4201,7 @@ function Window:_BuildMiniIconFrame(parentGui: ScreenGui): Frame
         Parent           = parentGui,
     })
     ComponentHelper.AddCorner(frame, 8)
-    ComponentHelper.AddStroke(frame, ThemeEngine.GetToken("Border"), 1)
+    self._miniIconStroke = ComponentHelper.AddStroke(frame, ThemeEngine.GetToken("Border"), 1)
 
     -- Glyph label
     ComponentHelper.Create("TextLabel", {
@@ -4841,6 +4841,9 @@ function Window:MiniIconify()
 
     self.ContentContainer.Visible = false
 
+    if self._mainStroke then
+        TweenHelper.Tween(self._mainStroke, TweenHelper.FastInfo, { Transparency = 1 })
+    end
     AnimationEngine.FadeOut(self.MainFrame, TweenHelper.FastInfo)
     local _miniIconHideDelay = task.delay(TweenHelper.FastInfo.Time + 0.02, function()
         if not self._destroyed then
@@ -4852,7 +4855,11 @@ function Window:MiniIconify()
     -- Show MiniIconFrame: fade + spring pop
     self._miniIconFrame.BackgroundTransparency = 1
     self._miniIconFrame.Visible                = true
+    if self._miniIconStroke then self._miniIconStroke.Transparency = 1 end
     AnimationEngine.FadeIn(self._miniIconFrame, 1, TweenHelper.DefaultInfo)
+    if self._miniIconStroke then
+        TweenHelper.Tween(self._miniIconStroke, TweenHelper.DefaultInfo, { Transparency = 0 })
+    end
     AnimationEngine.Pop(self._miniIconFrame, 0.80, AnimationEngine.Preset.Spring)
 
     if self._config.OnMiniIcon then
@@ -4868,6 +4875,7 @@ function Window:RestoreFromMiniIcon()
     if not self.IsMiniIcon or self._destroyed then return end
     self.IsMiniIcon = false
 
+    if self._miniIconStroke then self._miniIconStroke.Transparency = 1 end
     AnimationEngine.FadeOut(self._miniIconFrame, TweenHelper.FastInfo)
     task.delay(TweenHelper.FastInfo.Time + 0.02, function()
         if not self._destroyed then
@@ -4884,6 +4892,9 @@ function Window:RestoreFromMiniIcon()
     self.ContentContainer.Visible         = true
 
     AnimationEngine.FadeIn(self.MainFrame, 1, TweenHelper.DefaultInfo)
+    if self._mainStroke then
+        TweenHelper.Tween(self._mainStroke, TweenHelper.DefaultInfo, { Transparency = 0 })
+    end
     AnimationEngine.Pop(self.MainFrame, 0.92, AnimationEngine.Preset.Spring)
 
     if self._config.OnRestore then
@@ -7173,8 +7184,14 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
                 })
             end
         end
-        BindBtn.Text       = keyDisplayName()
-        BindBtn.TextColor3 = ThemeEngine.GetToken("Text")
+        -- Show status: green "ON" if floating button active, else key name
+        if _touchEnabled then
+            BindBtn.Text       = "ON"
+            BindBtn.TextColor3 = ThemeEngine.GetToken("Positive")
+        else
+            BindBtn.Text       = keyDisplayName()
+            BindBtn.TextColor3 = ThemeEngine.GetToken("Text")
+        end
         TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
             Color = ThemeEngine.GetToken("Border"),
         })
@@ -7254,7 +7271,9 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
                 _wasDragged = true
             end
             -- Only reposition during placement mode.
-            if _isPlacementMode and _wasDragged then
+            -- Always reposition during placement mode — no threshold gate.
+            -- Threshold (_wasDragged) is still tracked above for tap detection only.
+            if _isPlacementMode then
                 local newPos = _clampPosition(_btnStartPos + delta, TOUCH_BTN_SIZE)
                 TouchButton.Position = UDim2.fromOffset(newPos.X, newPos.Y)
             end
@@ -7465,6 +7484,13 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         if not TouchButton then return end
         _touchEnabled       = visible == true
         TouchButton.Visible = _touchEnabled
+        if _touchEnabled then
+            BindBtn.Text       = "ON"
+            BindBtn.TextColor3 = ThemeEngine.GetToken("Positive")
+        else
+            BindBtn.Text       = keyDisplayName()
+            BindBtn.TextColor3 = ThemeEngine.GetToken("Text")
+        end
         if not _touchEnabled and _isPlacementMode then
             _exitPlacementMode()
         end
