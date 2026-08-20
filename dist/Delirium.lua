@@ -1,4 +1,4 @@
--- Delirium v0.3.8  [Delirium.lua]
+-- Delirium v0.3.9  [Delirium.lua]
 -- GENERATED FILE
 -- DO NOT EDIT
 --
@@ -788,6 +788,7 @@ end
 -- Clear all handlers without destroying the Signal object.
 -- Safe to call from Reset() paths where other modules still hold the Signal ref.
 function Signal:DisconnectAll()
+    if not self._handlers then return end
     table.clear(self._handlers)
 end
 
@@ -4800,11 +4801,12 @@ function Window:MiniIconify()
     self.ContentContainer.Visible = false
 
     AnimationEngine.FadeOut(self.MainFrame, TweenHelper.FastInfo)
-    task.delay(TweenHelper.FastInfo.Time + 0.02, function()
+    local _miniIconHideDelay = task.delay(TweenHelper.FastInfo.Time + 0.02, function()
         if not self._destroyed then
             self.MainFrame.Visible = false
         end
     end)
+    self._maid:GiveTask(function() task.cancel(_miniIconHideDelay) end)
 
     -- Show MiniIconFrame: fade + spring pop
     self._miniIconFrame.BackgroundTransparency = 1
@@ -6089,6 +6091,7 @@ _Delirium_modules["Components.Divider"] = function()
 local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
 local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Maid            = _Delirium_require("Core.Maid")
 
 local Divider = {}
 
@@ -6179,8 +6182,8 @@ function Divider.New(parent: Instance, config: table)
             rightLine.Size = UDim2.new(0, lineW, 0, 1)
         end
 
-        textLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines)
-        frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines)
+        maid:GiveTask(textLabel:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines))
+        maid:GiveTask(frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_resizeLines))
         -- Deferred fallback: runs after the current layout pass fully resolves.
         task.defer(_resizeLines)
     end
@@ -6196,6 +6199,7 @@ function Divider.New(parent: Instance, config: table)
     -- ─── Public API ──────────────────────────────────────────────────────────
 
     local _destroyed = false
+    local maid       = Maid.new()
     local api = {}
 
     function api:SetLabel(text: string)
@@ -6208,6 +6212,7 @@ function Divider.New(parent: Instance, config: table)
     function api:Destroy()
         if _destroyed then return end
         _destroyed = true
+        maid:DoCleaning()
         themeDisconnect()
         frame:Destroy()
     end
@@ -6722,27 +6727,30 @@ function Dropdown.New(parent: Instance, config: table, debugId: string?)
         isOpen = true
         TweenHelper.Tween(Arrow, TweenHelper.FastInfo, { Rotation = 180 })
 
-        -- Outside click listener to auto-close popup
-        task.defer(function()
-            outsideClickConn = UserInputService.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1
-                    or input.UserInputType == Enum.UserInputType.Touch then
-                    local mPos = input.Position
-                    if PopupFrame and PopupFrame.Parent then
-                        local pPos = PopupFrame.AbsolutePosition
-                        local pSize = PopupFrame.AbsoluteSize
-                        local tPos = Trigger.AbsolutePosition
-                        local tSize = Trigger.AbsoluteSize
+        -- Outside click listener to auto-close popup.
+        -- Langsung connect tanpa task.defer:
+        -- Trigger.Activated terpanggil setelah InputEnded, jadi koneksi ini
+        -- tidak akan menangkap klik yang sama yang membuka popup.
+        -- Dengan direct connect, destroyPopup() selalu punya handle valid
+        -- untuk di-disconnect — tidak ada race condition.
+        outsideClickConn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                local mPos = input.Position
+                if PopupFrame and PopupFrame.Parent then
+                    local pPos = PopupFrame.AbsolutePosition
+                    local pSize = PopupFrame.AbsoluteSize
+                    local tPos = Trigger.AbsolutePosition
+                    local tSize = Trigger.AbsoluteSize
 
-                        local inPopup = (mPos.X >= pPos.X and mPos.X <= pPos.X + pSize.X and mPos.Y >= pPos.Y and mPos.Y <= pPos.Y + pSize.Y)
-                        local inTrigger = (mPos.X >= tPos.X and mPos.X <= tPos.X + tSize.X and mPos.Y >= tPos.Y and mPos.Y <= tPos.Y + tSize.Y)
+                    local inPopup = (mPos.X >= pPos.X and mPos.X <= pPos.X + pSize.X and mPos.Y >= pPos.Y and mPos.Y <= pPos.Y + pSize.Y)
+                    local inTrigger = (mPos.X >= tPos.X and mPos.X <= tPos.X + tSize.X and mPos.Y >= tPos.Y and mPos.Y <= tPos.Y + tSize.Y)
 
-                        if not inPopup and not inTrigger then
-                            destroyPopup()
-                        end
+                    if not inPopup and not inTrigger then
+                        destroyPopup()
                     end
                 end
-            end)
+            end
         end)
     end
 
@@ -7319,6 +7327,7 @@ local TextService     = game:GetService("TextService")
 local ComponentHelper = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper     = _Delirium_require("Utilities.TweenHelper")
 local ThemeEngine     = _Delirium_require("Core.ThemeEngine")
+local Maid            = _Delirium_require("Core.Maid")
 
 local Paragraph = {}
 
@@ -7435,13 +7444,13 @@ function Paragraph.New(parent: Instance, config: table)
     end
 
     -- Re-measure when frame width settles (resolves 1-scale children after parent layout).
-    frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_measureBody)
+    maid:GiveTask(frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_measureBody))
 
     -- Re-measure when text changes (SetContent / Append calls update Text synchronously,
     -- so defer one frame to let the frame width be current before measuring).
-    bodyLabel:GetPropertyChangedSignal("Text"):Connect(function()
+    maid:GiveTask(bodyLabel:GetPropertyChangedSignal("Text"):Connect(function()
         task.defer(_measureBody)
-    end)
+    end))
 
     -- Initial measure: defer one frame so the parent container resolves its AbsoluteSize
     -- before we try to read frame.AbsoluteSize.X (which would be 0 if we read it now).
@@ -7461,6 +7470,7 @@ function Paragraph.New(parent: Instance, config: table)
     -- ─── Public API ──────────────────────────────────────────────────────────
 
     local _destroyed = false
+    local maid       = Maid.new()
     local api = {}
 
     function api:SetTitle(text: string)
@@ -7485,6 +7495,7 @@ function Paragraph.New(parent: Instance, config: table)
     function api:Destroy()
         if _destroyed then return end
         _destroyed = true
+        maid:DoCleaning()
         themeDisconnect()
         frame:Destroy()
     end
@@ -8600,6 +8611,208 @@ function Toggle.New(parent: Instance, config: table, debugId: string?)
 end
 
 return Toggle
+
+end
+
+-- ── Services.AuthService ──────────────────────────────────
+_Delirium_modules["Services.AuthService"] = function()
+-- Services/AuthService.lua
+-- Client for the Delirium auth backend (Backend/server.js).
+--
+-- Login gives you a JWT session token. Admin-role tokens can create/list/delete
+-- accounts. The token lives in memory only for this session — never persisted
+-- to disk by this service (avoids leaking credentials via ConfigService files).
+--
+-- Setup:
+--   AuthService.Configure({ baseUrl = "https://your-backend.example.com" })
+--
+-- Usage:
+--   local ok, err = AuthService.Login("myuser", "mypassword")
+--   if ok then
+--       if AuthService.IsAdmin() then
+--           local ok2, result = AuthService.CreateAccount("newuser", "newpass123", "user")
+--       end
+--   end
+
+local AuthService = {}
+
+-- ─── State ───────────────────────────────────────────────────────────────────
+
+local _baseUrl  = nil   -- e.g. "https://your-backend.example.com"
+local _token    = nil
+local _user     = nil   -- { id, username, role, created_at }
+
+-- ─── HTTP transport ──────────────────────────────────────────────────────────
+-- Roblox HttpService:RequestAsync is blocked for external hosts on most
+-- executors; fall back through common executor request functions.
+
+local HttpService = game:GetService("HttpService")
+
+local function _rawRequest(opts: table)
+    local fn = (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+        or (fluxus and fluxus.request)
+    if fn then
+        local ok, res = pcall(fn, opts)
+        if ok then return res end
+        return nil, tostring(res)
+    end
+
+    -- Fallback to HttpService (works if the game/executor allows it).
+    local ok, res = pcall(function()
+        return HttpService:RequestAsync({
+            Url = opts.Url,
+            Method = opts.Method,
+            Headers = opts.Headers,
+            Body = opts.Body,
+        })
+    end)
+    if ok then return res end
+    return nil, tostring(res)
+end
+
+local function _request(method: string, path: string, body: table?, useAuth: boolean?)
+    if not _baseUrl then
+        return false, "AuthService not configured — call AuthService.Configure({ baseUrl = ... }) first"
+    end
+
+    local headers = { ["Content-Type"] = "application/json" }
+    if useAuth then
+        if not _token then
+            return false, "not logged in"
+        end
+        headers["Authorization"] = "Bearer " .. _token
+    end
+
+    local res, err = _rawRequest({
+        Url = _baseUrl .. path,
+        Method = method,
+        Headers = headers,
+        Body = body and HttpService:JSONEncode(body) or nil,
+    })
+
+    if not res then
+        return false, "request failed: " .. tostring(err)
+    end
+
+    local status = res.StatusCode or res.status_code or res.status
+    local rawBody = res.Body or res.body
+
+    local decoded
+    if rawBody and #rawBody > 0 then
+        local ok, d = pcall(HttpService.JSONDecode, HttpService, rawBody)
+        decoded = ok and d or nil
+    end
+
+    if not status or status < 200 or status >= 300 then
+        local msg = (decoded and decoded.error) or ("HTTP " .. tostring(status))
+        return false, msg
+    end
+
+    return true, decoded
+end
+
+-- ─── Public API ───────────────────────────────────────────────────────────────
+
+-- Configure the backend URL. Must be called before Login/CreateAccount.
+function AuthService.Configure(opts: table)
+    assert(type(opts) == "table" and type(opts.baseUrl) == "string" and #opts.baseUrl > 0,
+        "AuthService.Configure: opts.baseUrl (string) is required")
+    -- Strip trailing slash so path concatenation doesn't produce "//api/..."
+    _baseUrl = (opts.baseUrl:gsub("/+$", ""))
+end
+
+-- Log in with username + password. Stores the session token in memory on success.
+-- Returns true, user  or  false, errorMessage
+function AuthService.Login(username: string, password: string)
+    local ok, result = _request("POST", "/api/login", { username = username, password = password })
+    if not ok then
+        return false, result
+    end
+    _token = result.token
+    _user  = result.user
+    return true, _user
+end
+
+-- Clears the in-memory session.
+function AuthService.Logout()
+    _token = nil
+    _user  = nil
+end
+
+function AuthService.IsLoggedIn(): boolean
+    return _token ~= nil
+end
+
+function AuthService.IsAdmin(): boolean
+    return _user ~= nil and _user.role == "admin"
+end
+
+-- Returns a copy of the current user's public info, or nil if not logged in.
+function AuthService.GetCurrentUser(): table?
+    if not _user then return nil end
+    local copy = {}
+    for k, v in pairs(_user) do copy[k] = v end
+    return copy
+end
+
+-- Admin-only: create a new account.
+-- role: "user" (default) or "admin"
+-- Returns true, user  or  false, errorMessage
+function AuthService.CreateAccount(username: string, password: string, role: string?)
+    if not AuthService.IsAdmin() then
+        return false, "only an admin session can create accounts"
+    end
+    local ok, result = _request("POST", "/api/accounts", {
+        username = username,
+        password = password,
+        role = role,
+    }, true)
+    if not ok then
+        return false, result
+    end
+    return true, result.user
+end
+
+-- Admin-only: list all accounts.
+function AuthService.ListAccounts()
+    if not AuthService.IsAdmin() then
+        return false, "only an admin session can list accounts"
+    end
+    local ok, result = _request("GET", "/api/accounts", nil, true)
+    if not ok then
+        return false, result
+    end
+    return true, result.users
+end
+
+-- Admin-only: delete an account by id.
+function AuthService.DeleteAccount(userId: number)
+    if not AuthService.IsAdmin() then
+        return false, "only an admin session can delete accounts"
+    end
+    local ok, result = _request("DELETE", "/api/accounts/" .. tostring(userId), nil, true)
+    if not ok then
+        return false, result
+    end
+    return true
+end
+
+-- ─── Self-register ────────────────────────────────────────────────────────────
+
+local ServiceRegistry = _Delirium_require("Core.ServiceRegistry")
+
+ServiceRegistry.Register("AuthService", {
+    Reset = function()
+        -- Session does NOT survive a re-exec — force re-login for safety.
+        _token = nil
+        _user  = nil
+    end,
+}, 20)
+
+return AuthService
 
 end
 
@@ -10049,6 +10262,11 @@ function NotificationService.Reset()
             end
         end)
     end
+    -- Hancurkan container juga supaya tidak ada sisa frame nempel di GUI
+    -- kalau Reset dipanggil tanpa destroy ScreenGui.
+    if _container and _container.Parent then
+        pcall(function() _container:Destroy() end)
+    end
     _container   = nil
     _initialized = false
 end
@@ -10222,7 +10440,7 @@ local GUI_NAME    = "DeliriumUI"
 -- ─── Public API Declaration ────────────────────────────────────────────────
 -- Declared at file top-level so Delirium is never nil during execution
 
-local Delirium = { Version = "0.3.8" }
+local Delirium = { Version = "0.3.9" }
 
 -- ─── State ─────────────────────────────────────────────────────────────────
 
