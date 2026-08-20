@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════
--- Delirium Universal v2.4.0
+-- Delirium Universal v2.4.0  [PUBLISH BUILD]
 -- ═══════════════════════════════════════════════════════════════
 
 print("[Delirium DEBUG] [1/25] Waiting for game to load...")
@@ -8,39 +8,10 @@ print("[Delirium DEBUG] [2/25] Game loaded. Buffer 1s...")
 task.wait(1)
 
 -- ── LOAD DELIRIUM ──────────────────────────────────────────────
-local DELIRIUM_LOCAL_PATHS = {
-    "Delirium/dist/Delirium.lua",                          -- cwd = Dev\
-    "Delirium\\dist\\Delirium.lua",                        -- cwd = Dev\ (backslash)
-    "Dev/Delirium/dist/Delirium.lua",                      -- cwd = Workspace\
-    "Dev\\Delirium\\dist\\Delirium.lua",                    -- cwd = Workspace\ (backslash)
-    "dist/Delirium.lua",                                   -- cwd = Delirium\
-    "dist\\Delirium.lua",                                  -- cwd = Delirium\ (backslash)
-    "../dist/Delirium.lua",                                -- cwd = Delirium-Hub\
-    "..\\dist\\Delirium.lua",
-    "Workspace/Dev/Delirium/dist/Delirium.lua",
-    "Workspace\\Dev\\Delirium\\dist\\Delirium.lua",
-    "Madium/Workspace/Dev/Delirium/dist/Delirium.lua",
-    "Madium\\Workspace\\Dev\\Delirium\\dist\\Delirium.lua",
-}
 local DELIRIUM_RAW_URL = "https://raw.githubusercontent.com/DanteLuau/Delirium-Projects/refs/heads/main/dist/Delirium.lua"
 
-local src
-if type(readfile) == "function" and type(isfile) == "function" then
-    for _, path in ipairs(DELIRIUM_LOCAL_PATHS) do
-        if isfile(path) then
-            local ok, content = pcall(readfile, path)
-            if ok and content and #content > 100 then
-                src = content
-                print("[Delirium] loaded local: " .. path)
-                break
-            end
-        end
-    end
-end
-if not src or #src < 100 then
-    print("[Delirium] fetching from GitHub...")
-    src = game:HttpGet(DELIRIUM_RAW_URL)
-end
+print("[Delirium] fetching from GitHub...")
+local src = game:HttpGet(DELIRIUM_RAW_URL)
 assert(src and #src > 100, "[Delirium] failed to load Delirium.lua")
 
 pcall(function()
@@ -78,9 +49,6 @@ Variants.RegisterVariantThemeResolver("Button", "Subtle", function(tokens)
     return { ThemeBorderColor = tokens.Border or tokens.Accent }
 end)
 
--- BUG-TOGGLE-NIL: RegisterVariant does a full REPLACE, not a merge.
--- Partial props wipe TrackW/TrackH/KnobSize → Toggle.New crashes on -style.TrackH/2.
--- Fix: always pass the complete prop set when overriding built-in variants.
 Variants.RegisterVariant("Toggle", "Compact", {
     Height=36, HeightDesc=44, Corner=6,
     PadTop=4,  PadBot=4,      PadL=10, PadR=10,
@@ -96,7 +64,6 @@ Variants.RegisterVariant("Toggle", "Large", {
     PadTop=8,  PadBot=8,      PadL=14, PadR=14,
     TrackW=44, TrackH=24,    KnobSize=18,
 })
--- BUG-SLIDER-NIL: same issue — partial props strip Corner/PadL/PadR from Slider variants.
 Variants.RegisterVariant("Slider", "Compact", {
     Height=48, Corner=6, PadTop=6,  PadBot=6,  PadL=10, PadR=10, TrackH=4,
 })
@@ -195,7 +162,6 @@ local function fpsBlock(fps, cap)
     return GRAPH_BLOCKS[math.floor(ratio * 8) + 1]
 end
 
--- Robust label text updater — tries every known Delirium Label API
 local function setLabelText(lbl, text)
     if not lbl then return end
     pcall(function()
@@ -203,7 +169,6 @@ local function setLabelText(lbl, text)
         if type(lbl.Set)       == "function" then lbl:Set(text);      return end
         if type(lbl.SetText)   == "function" then lbl:SetText(text);  return end
         if type(lbl.SetValue)  == "function" then lbl:SetValue(text); return end
-        -- Fall back to scanning for TextLabel instances
         if lbl.Instance then
             for _, child in ipairs(lbl.Instance:GetDescendants()) do
                 if child:IsA("TextLabel") then child.Text = text end
@@ -212,7 +177,6 @@ local function setLabelText(lbl, text)
     end)
 end
 
--- Robust textbox value getter
 local function getTextboxValue(tb, fallback)
     if not tb then return fallback or "" end
     local v = fallback or ""
@@ -225,7 +189,6 @@ local function getTextboxValue(tb, fallback)
     return v
 end
 
--- Ensure a Lighting post-processing effect exists; returns it
 local function ensureLightingEffect(className)
     local eff = Lighting:FindFirstChildOfClass(className)
     if not eff then
@@ -348,15 +311,15 @@ function Compat.Check(feature)
     if not check then return {Status="UNAVAILABLE", Reason="Unknown feature"} end
     local result = check()
     local ok = (result == true) or (type(result)=="boolean" and result)
-    if type(result)=="table" then ok = result[1] end -- pcall returns ok, err
+    if type(result)=="table" then ok = result[1] end
     return ok and {Status="SUPPORTED"} or {Status="UNAVAILABLE", Reason=reasons[feature] or "unavailable"}
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- MODULE: Session  (internal only — no UI tab)
+-- MODULE: Session
 -- ═══════════════════════════════════════════════════════════════
 local SessionModule = {
-    Name="Session", Category="Session", Version="2.3.0", Status="OFF",
+    Name="Session", Category="Session", Version="2.4.0", Status="OFF",
     _maid=newMaid(), JoinTime=os.clock(), DeathCount=0, RespawnCount=0,
     FpsHistory={}, PingHistory={}, _deathConn=nil, _charConn=nil,
     Description="Internal session tracking", Dependencies={},
@@ -415,7 +378,7 @@ Registry.Register(SessionModule)
 -- MODULE: Performance Monitor
 -- ═══════════════════════════════════════════════════════════════
 local PerfModule = {
-    Name="Performance Monitor", Category="Performance", Version="2.3.0", Status="OFF",
+    Name="Performance Monitor", Category="Performance", Version="2.4.0", Status="OFF",
     Description="Live FPS, ping, memory, network stats", Dependencies={},
     _maid=newMaid(),
     FPS=0, AvgFPS=0, MinFPS=math.huge, MaxFPS=0,
@@ -457,7 +420,6 @@ function PerfModule:Enable()
         if fps < self.MinFPS then self.MinFPS = fps end
         if fps > self.MaxFPS then self.MaxFPS = fps end
 
-        -- Ping — robust multi-path search
         local ping = 0
         pcall(function()
             local net = Stats:FindFirstChild("Network")
@@ -469,7 +431,6 @@ function PerfModule:Enable()
                 end
             end
         end)
-        -- Fallback: scan Stats descendants for any ping stat
         if ping == 0 then
             pcall(function()
                 for _, v in ipairs(Stats:GetDescendants()) do
@@ -487,7 +448,6 @@ function PerfModule:Enable()
         pcall(function() self.MemoryMB = round(Stats:GetTotalMemoryUsageMb(), 1) end)
         self:_push(self._memHistory, self.MemoryMB)
 
-        -- Network throughput — robust FindFirstChild approach
         pcall(function()
             local net = Stats:FindFirstChild("Network")
             if net then
@@ -516,12 +476,11 @@ function PerfModule:Destroy() self:Disable() end
 function PerfModule:IsSupported() return true end
 function PerfModule:GetStatus() return self.Status end
 
--- FPS Cap: disabled → remove executor cap (Roblox reverts to its own limiter)
 function PerfModule:SetFPSCap(enabled, value)
     self.FPSCapEnabled = enabled
     if value then self.FPSCapValue = value end
     if not enabled then
-        pcall(function() setfpscap(0) end)   -- 0 = remove cap, Roblox handles default
+        pcall(function() setfpscap(0) end)
         Logger.Info("Performance", "FPS cap removed")
         return
     end
@@ -536,7 +495,7 @@ Registry.Register(PerfModule)
 -- MODULE: Visual
 -- ═══════════════════════════════════════════════════════════════
 local VisualModule = {
-    Name="Visual", Category="Visual", Version="2.3.0", Status="OFF",
+    Name="Visual", Category="Visual", Version="2.4.0", Status="OFF",
     Description="Fullbright, atmosphere, fog, post-processing", Dependencies={},
     _maid=newMaid(), _originals={},
     FogStart=0, FogEnd=300, FogColor=Color3.fromRGB(200,200,210),
@@ -607,7 +566,6 @@ function VisualModule:SetFullbright(enabled)
     Logger.Info("Visual", "Fullbright: "..(enabled and "ON" or "OFF"))
 end
 
--- Fog: clean split between apply and restore
 function VisualModule:_applyFog()
     pcall(function()
         Lighting.FogStart = self.FogStart
@@ -633,7 +591,6 @@ function VisualModule:SetBrightness(val)  pcall(function() Lighting.Brightness  
 function VisualModule:SetClockTime(val)   pcall(function() Lighting.ClockTime      = val end) end
 function VisualModule:SetGlobalShadows(v) pcall(function() Lighting.GlobalShadows  = v   end) end
 
--- Post-processing: create effect if game doesn't have one
 function VisualModule:SetBloom(enabled, intensity)
     pcall(function()
         local bloom = ensureLightingEffect("BloomEffect")
@@ -685,7 +642,7 @@ Registry.Register(VisualModule)
 -- MODULE: Player
 -- ═══════════════════════════════════════════════════════════════
 local PlayerModule = {
-    Name="Player", Category="Player", Version="2.3.0", Status="OFF",
+    Name="Player", Category="Player", Version="2.4.0", Status="OFF",
     Description="Player info and character utilities", Dependencies={},
     _maid=newMaid(),
 }
@@ -710,7 +667,6 @@ function PlayerModule:GetLocalInfo()
         info.Health=round(hum.Health,1); info.MaxHealth=round(hum.MaxHealth,1)
         info.WalkSpeed=hum.WalkSpeed; info.JumpPower=hum.JumpPower
         info.State=hum:GetState().Name
-        -- Check stamina attribute (common in games)
         local st = hum:GetAttribute("Stamina") or hum:GetAttribute("stamina") or hum:GetAttribute("Energy")
         if st then info.Stamina = round(st, 1) end
     end
@@ -771,7 +727,7 @@ Registry.Register(PlayerModule)
 -- MODULE: Server
 -- ═══════════════════════════════════════════════════════════════
 local ServerModule = {
-    Name="Server", Category="Server", Version="2.3.0", Status="OFF",
+    Name="Server", Category="Server", Version="2.4.0", Status="OFF",
     Description="Server info, job ID, region", Dependencies={},
     _maid=newMaid(), _gameName="Loading...",
 }
@@ -862,7 +818,7 @@ Registry.Register(ServerModule)
 -- MODULE: Explorer
 -- ═══════════════════════════════════════════════════════════════
 local ExplorerModule = {
-    Name="Explorer", Category="Explorer", Version="2.3.0", Status="OFF",
+    Name="Explorer", Category="Explorer", Version="2.4.0", Status="OFF",
     Description="Instance inspector and search", Dependencies={},
     _maid=newMaid(), _results={}, _searchRoot=nil, _selectedInst=nil,
 }
@@ -923,7 +879,6 @@ function ExplorerModule:GetInstanceInfo(inst)
         for _ in pairs(attrs) do attrCount += 1 end
         info.Attributes = attrCount
         info.Tags = table.concat(inst:GetTags(), ", ")
-        -- Try to get common properties
         pcall(function()
             if inst:IsA("BasePart") then
                 info.Position = string.format("%.1f, %.1f, %.1f", inst.Position.X, inst.Position.Y, inst.Position.Z)
@@ -953,7 +908,7 @@ Registry.Register(ExplorerModule)
 -- MODULE: Automation
 -- ═══════════════════════════════════════════════════════════════
 local AutoModule = {
-    Name="Automation", Category="Automation", Version="2.3.0", Status="OFF",
+    Name="Automation", Category="Automation", Version="2.4.0", Status="OFF",
     Description="Anti-AFK and automation utilities", Dependencies={},
     _maid=newMaid(), _afkConn=nil, _afkTimerConn=nil, _afkEnabled=false,
 }
@@ -985,7 +940,6 @@ function AutoModule:SetAntiAFK(enabled)
         Logger.Info("Automation", "AntiAFK fired")
     end
 
-    -- Primary: LP.Idled fires when Roblox detects ~2min idle
     local ok, conn = pcall(function()
         return LP.Idled:Connect(fireAfk)
     end)
@@ -994,11 +948,10 @@ function AutoModule:SetAntiAFK(enabled)
         self._maid:Give(conn)
     end
 
-    -- Backup timer every 3.5 minutes regardless of Idled event
     local elapsed = 0
     self._afkTimerConn = RunService.Heartbeat:Connect(function(dt)
         elapsed += dt
-        if elapsed < 210 then return end  -- 3.5 minutes
+        if elapsed < 210 then return end
         elapsed = 0
         fireAfk()
     end)
@@ -1012,7 +965,7 @@ Registry.Register(AutoModule)
 -- MODULE: HUD
 -- ═══════════════════════════════════════════════════════════════
 local HUDModule = {
-    Name="HUD", Category="HUD", Version="2.3.0", Status="OFF",
+    Name="HUD", Category="HUD", Version="2.4.0", Status="OFF",
     Description="On-screen overlay", Dependencies={"Performance Monitor"},
     _maid=newMaid(), _gui=nil, _frame=nil, _labels={}, _updateConn=nil,
     Config = {
@@ -1067,7 +1020,6 @@ function HUDModule:Enable()
     mkLabel("stamina",11); mkLabel("deaths",12)
     mkLabel("graph",13, Color3.fromRGB(100,220,255))
 
-    -- Drag support
     local dragging, ds, sp = false, nil, nil
     frame.InputBegan:Connect(function(inp)
         if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
@@ -1226,7 +1178,7 @@ Registry.Register(HUDModule)
 -- MODULE: Character
 -- ═══════════════════════════════════════════════════════════════
 local CharacterModule = {
-    Name="Character", Category="Character", Version="2.3.0", Status="OFF",
+    Name="Character", Category="Character", Version="2.4.0", Status="OFF",
     Description="Movement, fly, noclip, god mode, teleport", Dependencies={},
     _maid=newMaid(),
     AutoSprint=false, AutoJump=false, InfiniteJump=false,
@@ -1326,7 +1278,6 @@ function CharacterModule:SetNoclip(enabled)
     self._maid:Give(self._noclipConn)
 end
 
--- Fly — fixed: stiffer BodyGyro prevents collision spin
 function CharacterModule:SetFly(enabled)
     self.Fly = enabled
     if self._flyBV  then pcall(function() self._flyBV:Destroy()  end); self._flyBV  = nil end
@@ -1346,12 +1297,11 @@ function CharacterModule:SetFly(enabled)
     bv.MaxForce = Vector3.new(1e5,1e5,1e5); bv.Velocity = Vector3.zero; bv.P = 1e5
     bv.Parent = root; self._flyBV = bv; self._maid:Give(bv)
 
-    -- High-stiffness BodyGyro: prevents spin on object collision
     local bg = Instance.new("BodyGyro")
-    bg.MaxTorque = Vector3.new(1e7,1e7,1e7)  -- very high = collision cant spin you
-    bg.P         = 5e5                         -- stiff spring
-    bg.D         = 2500                        -- heavy damping
-    bg.CFrame    = root.CFrame                 -- init to current orientation
+    bg.MaxTorque = Vector3.new(1e7,1e7,1e7)
+    bg.P         = 5e5
+    bg.D         = 2500
+    bg.CFrame    = root.CFrame
     bg.Parent    = root; self._flyBG = bg; self._maid:Give(bg)
 
     local cam = workspace.CurrentCamera
@@ -1370,7 +1320,6 @@ function CharacterModule:SetFly(enabled)
 
         bv.Velocity = dir.Magnitude > 0 and dir.Unit * self.FlySpeed or Vector3.zero
 
-        -- Lock orientation: Y-axis yaw only (no pitch/roll from collisions)
         local yaw = math.atan2(-cf.LookVector.X, -cf.LookVector.Z)
         bg.CFrame  = CFrame.new(root.Position) * CFrame.Angles(0, yaw, 0)
     end)
@@ -1392,7 +1341,6 @@ function CharacterModule:SetGodMode(enabled)
     Logger.Info("Character", "God Mode enabled")
 end
 
--- Click-to-TP Tool: give player an equippable Roblox Tool
 function CharacterModule:GiveClickTPTool()
     self:RemoveClickTPTool()
     local tool = Instance.new("Tool")
@@ -1424,7 +1372,6 @@ function CharacterModule:RemoveClickTPTool()
     self._clickTPTool = nil
 end
 
--- TP to Spawn: finds all SpawnLocations, picks random if >1
 function CharacterModule:TeleportToSpawn()
     local root = self:_getRoot(); if not root then return end
     local spawns = {}
@@ -1468,7 +1415,7 @@ Registry.Register(CharacterModule)
 -- MODULE: Camera
 -- ═══════════════════════════════════════════════════════════════
 local CameraModule = {
-    Name="Camera", Category="Camera", Version="2.3.0", Status="OFF",
+    Name="Camera", Category="Camera", Version="2.4.0", Status="OFF",
     Description="FOV, camera modes, lock, shake disable", Dependencies={},
     _maid=newMaid(), _cam=nil,
     _origFOV=nil, _origMode=nil, _origSubject=nil,
@@ -1503,10 +1450,8 @@ function CameraModule:SetFOV(value)
     pcall(function() self._cam.FieldOfView = math.clamp(value, 1, 120) end)
 end
 
--- First Person: lock zoom to 0 every frame so game scripts can't override it
 function CameraModule:SetCameraMode(mode)
     self._cam = self._cam or workspace.CurrentCamera
-    -- disconnect any existing FP loop
     if self._fpConn then self._fpConn:Disconnect(); self._fpConn = nil end
 
     if mode == "FirstPerson" then
@@ -1516,7 +1461,6 @@ function CameraModule:SetCameraMode(mode)
                 self._origMaxZoom = LP.CameraMaxZoomDistance
             end)
         end
-        -- run every RenderStepped to fight game scripts resetting zoom
         self._fpConn = RunService.RenderStepped:Connect(function()
             pcall(function()
                 LP.CameraMinZoomDistance = 0
@@ -1526,7 +1470,6 @@ function CameraModule:SetCameraMode(mode)
         self._maid:Give(self._fpConn)
         Logger.Info("Camera", "First Person locked")
     else
-        -- ThirdPerson: restore zoom distances
         pcall(function()
             LP.CameraMinZoomDistance = self._origMinZoom or 0.5
             LP.CameraMaxZoomDistance = self._origMaxZoom or 400
@@ -1539,7 +1482,6 @@ function CameraModule:SetCameraMode(mode)
     end
 end
 
--- Camera Lock: Scriptable + enforce CameraType every frame (game scripts can't override)
 function CameraModule:SetCameraLock(enabled)
     if self._lockConn then self._lockConn:Disconnect(); self._lockConn = nil end
     if not enabled then
@@ -1555,7 +1497,6 @@ function CameraModule:SetCameraLock(enabled)
     pcall(function() self._cam.CameraType = Enum.CameraType.Scriptable end)
     self._lockConn = RunService.RenderStepped:Connect(function()
         pcall(function()
-            -- keep re-enforcing Scriptable in case game scripts fight it
             if self._cam.CameraType ~= Enum.CameraType.Scriptable then
                 self._cam.CameraType = Enum.CameraType.Scriptable
             end
@@ -1591,7 +1532,6 @@ function CameraModule:DisableShake(enabled)
     Logger.Info("Camera", "Shake disable attempted")
 end
 
--- View Distance: streaming radius + quality setting fallback
 function CameraModule:SetViewDistance(value)
     local applied = false
     pcall(function()
@@ -1601,7 +1541,6 @@ function CameraModule:SetViewDistance(value)
             applied = true
         end
     end)
-    -- Fallback: UserGameSettings quality level (1–21 scale)
     pcall(function()
         local ugs = UserSettings():GetService("UserGameSettings")
         if ugs then
@@ -1620,7 +1559,7 @@ Registry.Register(CameraModule)
 -- MODULE: Utility
 -- ═══════════════════════════════════════════════════════════════
 local UtilityModule = {
-    Name="Utility", Category="Utility", Version="2.3.0", Status="OFF",
+    Name="Utility", Category="Utility", Version="2.4.0", Status="OFF",
     Description="Copy utilities, screenshot mode, script loaders", Dependencies={},
     _maid=newMaid(), ScreenshotMode=false,
 }
@@ -1676,23 +1615,20 @@ Registry.Register(UtilityModule)
 -- MODULE: Performance Optimizer
 -- ═══════════════════════════════════════════════════════════════
 local OptimModule = {
-    Name="Performance Optimizer", Category="Performance", Version="2.3.0", Status="OFF",
+    Name="Performance Optimizer", Category="Performance", Version="2.4.0", Status="OFF",
     Description="Optimization presets: Low, Balanced, Performance", Dependencies={},
     _maid=newMaid(), _applied=false, _stateMap={}, CurrentProfile="BALANCED",
 }
 
 local PROFILES = {
-    -- LOW: minimal — just kills sun rays + blur
     LOW = {
         DisableBloom=false, DisableAtmo=false, DisableCC=false,
         DisableSunRays=true, DisableBlur=true, ReduceParticles=false, GlobalShadows=true,
     },
-    -- BALANCED: moderate — adds particle reduction
     BALANCED = {
         DisableBloom=false, DisableAtmo=false, DisableCC=false,
         DisableSunRays=true, DisableBlur=true, ReduceParticles=true, GlobalShadows=true,
     },
-    -- PERFORMANCE: maximum — kills everything expensive
     PERFORMANCE = {
         DisableBloom=true, DisableAtmo=true, DisableCC=false,
         DisableSunRays=true, DisableBlur=true, ReduceParticles=true, GlobalShadows=false,
@@ -1764,7 +1700,7 @@ Registry.Register(OptimModule)
 -- MODULE: Configuration
 -- ═══════════════════════════════════════════════════════════════
 local ConfigModule = {
-    Name="Configuration", Category="Configuration", Version="2.3.0", Status="OFF",
+    Name="Configuration", Category="Configuration", Version="2.4.0", Status="OFF",
     Description="Save/load/import/export config", Dependencies={},
     _maid=newMaid(), _config={},
 }
@@ -1950,7 +1886,6 @@ localSec:CreateSlider({Name="WalkSpeed Override", Min=0, Max=500, Default=16, Va
 localSec:CreateSlider({Name="JumpPower Override", Min=0, Max=500, Default=50, Variant=UI_DENSITY,
     Callback=function(v) PlayerModule:SetJumpPower(v) end})
 
--- Auto-refresh player info
 local _piTimer = 0
 RunService.Heartbeat:Connect(function(dt)
     _piTimer += dt; if _piTimer < 3 then return end; _piTimer = 0
@@ -2200,7 +2135,6 @@ fpscapSec:CreateSlider({Name="FPS Limit", Min=20, Max=240, Default=60, Variant=U
     end})
 
 local optimSec = perfTab:CreateSection("Optimization")
--- Guard: only apply profile when toggle is ON
 local _optimEnabled     = false
 local _optimProfile     = "BALANCED"
 local _optimInitialized = false
@@ -2274,13 +2208,11 @@ srvInfoSec:CreateButton({Name="Hop Server", Description="Jump to a different ser
         ServerModule:HopServer()
     end})
 
--- Auto-refresh with retry until we have real ping data
 local _srvTimer     = 0
 local _srvAttempts  = 0
 local function trySrvRefresh()
     _srvAttempts += 1
     pcall(refreshServerInfo)
-    -- keep retrying every 2s until ping is non-zero (max 15 attempts)
     if PerfModule.Ping == 0 and _srvAttempts < 15 then
         task.delay(2, trySrvRefresh)
     end
@@ -2293,18 +2225,16 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 -- ─────────────────────────────────────────────────────────────
--- TAB: Explorer  (remade)
+-- TAB: Explorer
 -- ─────────────────────────────────────────────────────────────
 print("[Delirium DEBUG] [Tab 8] Explorer...")
 local explorerTab = Win:CreateTab({Name="Explorer"})
 
--- State
 local _exResults   = {}
 local _exPage      = 1
 local _exPageSize  = 8
 local _exQuery     = ""
 local _exClassFilter = ""
-
 local _exResultLabel = nil
 local _exPageLabel   = nil
 local _exInfoLabel   = nil
@@ -2316,7 +2246,6 @@ local function exRender()
     local total = #_exResults
     local tp    = exTotalPages()
     _exPage = math.clamp(_exPage, 1, tp)
-
     local s = (_exPage-1)*_exPageSize + 1
     local e = math.min(_exPage*_exPageSize, total)
     local lines = {}
@@ -2337,18 +2266,14 @@ end
 
 local _exSelectValue = ""
 
--- Search section
 local exSearchSec = explorerTab:CreateSection("Search")
-
 local exRootDrop = exSearchSec:CreateDropdown({
     Name="Search Root",
     Options={"game","workspace","Players","Lighting","ReplicatedStorage","StarterGui","CoreGui"},
     Default="game",
     Variant=UI_DENSITY,
     Callback=function(v)
-        local roots = {
-            game=game, workspace=workspace, Players=Players, Lighting=Lighting,
-        }
+        local roots = { game=game, workspace=workspace, Players=Players, Lighting=Lighting }
         local ok, svc = pcall(function() return game:GetService(v) end)
         ExplorerModule._searchRoot = (ok and svc) or roots[v] or game
     end,
@@ -2382,7 +2307,6 @@ exSearchSec:CreateButton({Name="Clear Results", Variant="Subtle",
         if _exInfoLabel then setLabelText(_exInfoLabel,"—") end
     end})
 
--- Results section
 local exResultsSec = explorerTab:CreateSection("Results")
 _exResultLabel = exResultsSec:CreateLabel({Name="Results",  Text="(run a search above)"})
 _exPageLabel   = exResultsSec:CreateLabel({Name="PageInfo", Text=""})
@@ -2406,7 +2330,7 @@ local function getSelectedResult()
     return r
 end
 
-exResultsSec:CreateButton({Name="Show Info", Description="Display selected instance properties",
+exResultsSec:CreateButton({Name="Show Info",
     Callback=function()
         local r = getSelectedResult(); if not r or not r.Instance then return end
         local info = ExplorerModule:GetInstanceInfo(r.Instance)
@@ -2435,7 +2359,7 @@ exResultsSec:CreateButton({Name="Copy Name", Variant="Subtle",
         copyToClipboard(r.Name)
         Delirium:Notify({Title="Copied",Message=r.Name,Duration=2})
     end})
-exResultsSec:CreateButton({Name="Browse Children", Description="List children of selected instance",
+exResultsSec:CreateButton({Name="Browse Children",
     Callback=function()
         local r = getSelectedResult(); if not r or not r.Instance then return end
         local children = ExplorerModule:GetChildren(r.Instance)
@@ -2443,7 +2367,7 @@ exResultsSec:CreateButton({Name="Browse Children", Description="List children of
         exRender()
         Delirium:Notify({Title="Explorer",Message=r.Name.." → "..(#children).." children",Duration=2})
     end})
-exResultsSec:CreateButton({Name="Set as Search Root", Description="Search inside this instance",
+exResultsSec:CreateButton({Name="Set as Search Root",
     Callback=function()
         local r = getSelectedResult(); if not r or not r.Instance then return end
         ExplorerModule._searchRoot = r.Instance
@@ -2487,7 +2411,7 @@ hudStyleSec:CreateSlider({Name="Background Transparency", Min=0, Max=100, Defaul
     Callback=function(v) HUDModule:SetBgTransparency(v/100) end})
 hudStyleSec:CreateDropdown({Name="Position", Options={"TopRight","TopLeft","BottomRight","BottomLeft"}, Default="TopRight", Variant=UI_DENSITY,
     Callback=function(v) HUDModule:SetPosition(v) end})
-hudStyleSec:CreateButton({Name="Reset Position", Description="Snap back to top-right corner",
+hudStyleSec:CreateButton({Name="Reset Position",
     Callback=function() HUDModule:SetPosition("TopRight") end})
 
 -- ─────────────────────────────────────────────────────────────
@@ -2518,8 +2442,7 @@ end
 utilRegionSec:CreateButton({Name="Refresh Region",
     Callback=function()
         updateUtilRegion()
-        local r = ServerModule:GetRegion()
-        Delirium:Notify({Title="Region",Message=r,Duration=2})
+        Delirium:Notify({Title="Region",Message=ServerModule:GetRegion(),Duration=2})
     end})
 utilRegionSec:CreateButton({Name="Copy Region", Variant="Subtle",
     Callback=function()
@@ -2528,7 +2451,6 @@ utilRegionSec:CreateButton({Name="Copy Region", Variant="Subtle",
         Delirium:Notify({Title="Copied",Message=r,Duration=2})
     end})
 
--- Auto-update region label until we have real data
 local _utilRegConn
 local _utilRegTimer = 0
 _utilRegConn = RunService.Heartbeat:Connect(function(dt)
@@ -2544,15 +2466,15 @@ utilMiscSec:CreateToggle({Name="Screenshot Mode  (hide HUD)", Default=false, Var
 
 local utilLoaderSec = utilTab:CreateSection("Script Loaders")
 utilLoaderSec:CreateParagraph({Name="LoaderNote", Text="Scripts are fetched from third-party sources and executed in your exploiter context. Only load what you trust."})
-utilLoaderSec:CreateButton({Name="Load Dex++", Description="Dex Explorer Plus Plus",
+utilLoaderSec:CreateButton({Name="Load Dex++",
     Callback=function()
         UtilityModule:LoadScript("Dex++", "https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua")
     end})
-utilLoaderSec:CreateButton({Name="Load Infinite Yield", Description="IY admin commands by Edge",
+utilLoaderSec:CreateButton({Name="Load Infinite Yield",
     Callback=function()
         UtilityModule:LoadScript("Infinite Yield", "https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source")
     end})
-utilLoaderSec:CreateButton({Name="Load Cobalt", Description="Cobalt remote spy",
+utilLoaderSec:CreateButton({Name="Load Cobalt",
     Callback=function()
         UtilityModule:LoadScript("Cobalt", "https://gitlab.com/upio/cobalt/-/releases/permalink/latest/downloads/Cobalt.luau")
     end})
@@ -2567,7 +2489,7 @@ local consoleSec = diagTab:CreateSection("Internal Console")
 consoleSec:CreateParagraph({Name="ConsoleNote", Text="Internal log stream for all modules. Use the filter to search by keyword or category. Max 10 lines shown — copy all to get the full history."})
 local _logDisplay = consoleSec:CreateLabel({Name="Logs", Text="[Console ready]"})
 local _logFilter  = ""
-local MAX_LOG_LINES = 10  -- cap to prevent window overflow
+local MAX_LOG_LINES = 10
 
 local function refreshLogs()
     local entries = Logger.GetAll(_logFilter)
@@ -2576,8 +2498,7 @@ local function refreshLogs()
     for i = start, #entries do
         local e = entries[i]
         local line = string.format("[%s][%s] %s",
-            e.time, e.level:sub(1,1),
-            e.message:sub(1, 52))  -- truncate each line
+            e.time, e.level:sub(1,1), e.message:sub(1, 52))
         table.insert(lines, line)
     end
     setLabelText(_logDisplay, #lines > 0 and table.concat(lines, "\n") or "[empty]")
@@ -2650,9 +2571,7 @@ local pingWarnSec = autoTab:CreateSection("Ping Monitor")
 local _pingWarnEnabled = false
 local _pingThreshold   = 250
 pingWarnSec:CreateToggle({Name="High Ping Warning  (logs to console)", Default=false, Variant=UI_DENSITY,
-    Callback=function(v)
-        _pingWarnEnabled = v
-    end})
+    Callback=function(v) _pingWarnEnabled = v end})
 pingWarnSec:CreateSlider({Name="Threshold  (ms)", Min=50, Max=1000, Default=250, Variant=UI_DENSITY,
     Callback=function(v)
         _pingThreshold = v
@@ -2719,7 +2638,7 @@ configSec:CreateButton({Name="Apply Import",
         local ok = ConfigModule:Import(json)
         Delirium:Notify({Title="Config",Message=ok and "Imported" or "Failed — invalid JSON",Duration=3})
     end})
-configSec:CreateButton({Name="Reset to Defaults", Description="Restore all defaults",
+configSec:CreateButton({Name="Reset to Defaults",
     Callback=function()
         Delirium.Dialog.Confirm({
             Title   = "Reset to Defaults?",
@@ -2734,7 +2653,7 @@ configSec:CreateButton({Name="Reset to Defaults", Description="Restore all defau
     end})
 
 local modSec = settingsTab:CreateSection("Module Management")
-modSec:CreateButton({Name="Disable All Modules", Description="Disable all active modules",
+modSec:CreateButton({Name="Disable All Modules",
     Callback=function()
         Delirium.Dialog.Confirm({
             Title   = "Disable All Modules?",
