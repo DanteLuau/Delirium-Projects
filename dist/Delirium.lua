@@ -6938,6 +6938,7 @@ _Delirium_modules["Components.Keybind"] = function()
 --           Position persisted per-keybind title via ConfigService.
 
 local UserInputService = game:GetService("UserInputService")
+local GuiService       = game:GetService("GuiService")
 -- local Root             = script.Parent.Parent
 local ComponentHelper  = _Delirium_require("Utilities.ComponentHelper")
 local TweenHelper      = _Delirium_require("Utilities.TweenHelper")
@@ -6959,15 +6960,6 @@ local function _findScreenGui(inst: Instance): ScreenGui?
     return nil
 end
 
--- Clamp an offset Vector2 position so the button stays inside the viewport.
-local function _clampPosition(pos: Vector2, btnSize: Vector2): Vector2
-    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-        or Vector2.new(1920, 1080)
-    return Vector2.new(
-        math.clamp(pos.X, 0, vp.X - btnSize.X),
-        math.clamp(pos.Y, 0, vp.Y - btnSize.Y)
-    )
-end
 
 -- Touch button size (px). Touch-friendly 52×52 target.
 local TOUCH_BTN_SIZE = Vector2.new(52, 52)
@@ -6990,29 +6982,50 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     -- the same InputBegan dispatch (connection order is not guaranteed).
     local _justRebound = false
 
+    local BIND_TIMEOUT    = type(config.BindTimeout) == "number" and config.BindTimeout or 5
+    local countdownThread = nil
+
     local OnChanged   = Signal.new()
     local OnActivated = Signal.new()
 
     -- ─── ConfigService — touch button position persistence ─────────────────
     local _cfg     = ConfigService.GetProfile("Delirium_KeybindPositions")
-    local _cfgKeyX = "touchbtn_" .. title .. "_x"
-    local _cfgKeyY = "touchbtn_" .. title .. "_y"
+    local _cfgKeyX = "touchbtn2_" .. title .. "_offx"
+    local _cfgKeyY = "touchbtn2_" .. title .. "_offy"
 
-    local function _loadTouchPos(): Vector2
-        local x = _cfg:Get(_cfgKeyX, nil)
-        local y = _cfg:Get(_cfgKeyY, nil)
-        if x and y then
-            return _clampPosition(Vector2.new(x, y), TOUCH_BTN_SIZE)
-        end
-        -- Default: bottom-right quadrant.
-        local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-            or Vector2.new(800, 600)
-        return _clampPosition(Vector2.new(vp.X * 0.82, vp.Y * 0.88), TOUCH_BTN_SIZE)
+    -- Mirror of Window._ClampToScreen — clamps center offsets inside the usable
+    -- viewport accounting for topbar / home-bar insets via GuiService.
+    local function _clampToScreen(frame: GuiObject, rawOffX: number, rawOffY: number): UDim2
+        local cam    = workspace.CurrentCamera or { ViewportSize = Vector2.new(1920, 1080) }
+        local screen = cam.ViewportSize
+        local sz     = frame.AbsoluteSize
+        local topLeft, bottomRight = GuiService:GetGuiInset()
+        local cx = screen.X * 0.5 + rawOffX
+        local cy = screen.Y * 0.5 + rawOffY
+        local minX = sz.X * 0.5
+        local maxX = math.max(minX, screen.X - sz.X * 0.5)
+        local minY = topLeft.Y + sz.Y * 0.5
+        local maxY = math.max(minY, screen.Y - bottomRight.Y - sz.Y * 0.5)
+        cx = math.clamp(cx, minX, maxX)
+        cy = math.clamp(cy, minY, maxY)
+        return UDim2.new(0.5, cx - screen.X * 0.5, 0.5, cy - screen.Y * 0.5)
     end
 
-    local function _saveTouchPos(pos: Vector2)
-        _cfg:Set(_cfgKeyX, pos.X)
-        _cfg:Set(_cfgKeyY, pos.Y)
+    -- Position stored as center offsets: screen.X*0.5 + offX = absolute center X.
+    local function _loadTouchPos(): (number, number)
+        local x = _cfg:Get(_cfgKeyX, nil)
+        local y = _cfg:Get(_cfgKeyY, nil)
+        if x and y then return x, y end
+        -- Default: bottom-right quadrant expressed as center offset.
+        local cam    = workspace.CurrentCamera or { ViewportSize = Vector2.new(1920, 1080) }
+        local screen = cam.ViewportSize
+        return screen.X * 0.32 + TOUCH_BTN_SIZE.X * 0.5,
+               screen.Y * 0.38 + TOUCH_BTN_SIZE.Y * 0.5
+    end
+
+    local function _saveTouchPos(offX: number, offY: number)
+        _cfg:Set(_cfgKeyX, offX)
+        _cfg:Set(_cfgKeyY, offY)
         _cfg:Save()
     end
 
@@ -7116,6 +7129,10 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
             pcall(task.cancel, timeoutThread)
             timeoutThread = nil
         end
+        if countdownThread then
+            pcall(task.cancel, countdownThread)
+            countdownThread = nil
+        end
         BindBtn.Text       = keyDisplayName()
         BindBtn.TextColor3 = ThemeEngine.GetToken("Text")
         TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
@@ -7173,11 +7190,10 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     local function _exitPlacementMode()
         _isPlacementMode = false
         if TouchButton then
-            local pos = Vector2.new(
+            _saveTouchPos(
                 TouchButton.Position.X.Offset,
                 TouchButton.Position.Y.Offset
             )
-            _saveTouchPos(pos)
             if touchBtnStroke then
                 TweenHelper.Tween(touchBtnStroke, TweenHelper.FastInfo, {
                     Color = ThemeEngine.GetToken("Border"),
@@ -7207,11 +7223,12 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
             return
         end
 
-        local initPos = _loadTouchPos()
+        local initOffX, initOffY = _loadTouchPos()
 
         TouchButton = ComponentHelper.Create("TextButton", {
             Name             = "KeybindTouch_" .. title,
-            Position         = UDim2.fromOffset(initPos.X, initPos.Y),
+            AnchorPoint      = Vector2.new(0.5, 0.5),
+            Position         = UDim2.new(0.5, initOffX, 0.5, initOffY),
             Size             = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
             BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
             Text             = currentKey.Name:sub(1, 4),
@@ -7240,61 +7257,64 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
             }, "touch_press")
         end
 
-        -- Per-touch state.
-        local _activeDragInput = nil  -- InputObject that owns the current drag
+        -- ── Drag state — mirrors MiniIcon system exactly ──────────────────
+        -- Supports both mouse (desktop testing) and touch (mobile).
+        -- activeDragInput: nil for mouse (single device); InputObject for touch
+        --   identity tracking so a second finger can't hijack the gesture.
+        local _activeDragInput = nil
         local _dragStart       = nil
-        local _btnStartPos     = nil
+        local _btnStartOffX    = nil  -- center offset at gesture start
+        local _btnStartOffY    = nil
         local _wasDragged      = false
 
         _addTouchConn(TouchButton.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Touch then return end
-            if _activeDragInput ~= nil then return end  -- another touch already owns the drag
-            -- Claim this InputObject as the owner of the current drag.
-            _activeDragInput = input
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if input.UserInputType == Enum.UserInputType.Touch
+                and _activeDragInput ~= nil then return end  -- touch identity guard
+            _activeDragInput = (input.UserInputType == Enum.UserInputType.Touch) and input or nil
             _dragStart       = InputAdapter.GetPointerPosition(input)
-            _btnStartPos     = Vector2.new(
-                TouchButton.Position.X.Offset,
-                TouchButton.Position.Y.Offset
-            )
-            _wasDragged = false
+            _btnStartOffX    = TouchButton.Position.X.Offset
+            _btnStartOffY    = TouchButton.Position.Y.Offset
+            _wasDragged      = false
             if not _isPlacementMode then _animPress() end
         end))
 
-        -- Use global UIS.InputChanged instead of GuiObject.InputChanged.
-        -- GuiObject events stop firing when the finger leaves the button bounds;
-        -- global UIS tracks the same InputObject for its entire lifetime.
+        -- Global InputChanged — fires for the full lifetime of the input object
+        -- even when the pointer leaves the button bounds (critical for fast drags).
         _addTouchConn(UserInputService.InputChanged:Connect(function(input)
-            if input ~= _activeDragInput then return end  -- wrong touch, ignore
-            if not _dragStart or not _btnStartPos then return end
-            local delta = InputAdapter.GetPointerPosition(input) - _dragStart
-            if delta.Magnitude > InputAdapter.DRAG_THRESHOLD_TOUCH then
-                _wasDragged = true
-            end
-            -- Only reposition during placement mode.
-            -- Always reposition during placement mode — no threshold gate.
-            -- Threshold (_wasDragged) is still tracked above for tap detection only.
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if input.UserInputType == Enum.UserInputType.Touch
+                and input ~= _activeDragInput then return end  -- wrong touch, ignore
+            if not _dragStart then return end
+            local delta     = InputAdapter.GetPointerPosition(input) - _dragStart
+            local isTouch   = input.UserInputType == Enum.UserInputType.Touch
+            local threshold = isTouch and InputAdapter.DRAG_THRESHOLD_TOUCH
+                                       or InputAdapter.DRAG_THRESHOLD_MOUSE
+            if delta.Magnitude > threshold then _wasDragged = true end
             if _isPlacementMode then
-                local newPos = _clampPosition(_btnStartPos + delta, TOUCH_BTN_SIZE)
-                TouchButton.Position = UDim2.fromOffset(newPos.X, newPos.Y)
+                local newOffX = _btnStartOffX + delta.X
+                local newOffY = _btnStartOffY + delta.Y
+                TouchButton.Position = _clampToScreen(TouchButton, newOffX, newOffY)
             end
         end))
 
-        _addTouchConn(TouchButton.InputEnded:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Touch then return end
-            if input ~= _activeDragInput then return end  -- not our touch, ignore
+        _addTouchConn(UserInputService.InputEnded:Connect(function(input)
+            local isMouse = input.UserInputType == Enum.UserInputType.MouseButton1
+            local isTouch = input.UserInputType == Enum.UserInputType.Touch
+            if not isMouse and not isTouch then return end
+            if isTouch and input ~= _activeDragInput then return end  -- identity guard
             _animRelease()
-            if _isPlacementMode then
-                -- Position is saved when the user exits placement mode via BindBtn.
-                -- No disk write here — avoids repeated writefile on every finger-lift.
-            else
-                -- Normal mode: clean tap fires OnActivated.
+            if not _isPlacementMode then
                 if not _wasDragged and enabled then
                     OnActivated:Fire(currentKey)
                 end
             end
             _activeDragInput = nil
             _dragStart       = nil
-            _btnStartPos     = nil
+            _btnStartOffX    = nil
+            _btnStartOffY    = nil
             _wasDragged      = false
         end))
     end
@@ -7345,11 +7365,26 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         end
 
         isListening = true
-        BindBtn.Text       = "..."
-        BindBtn.TextColor3 = ThemeEngine.GetToken("Warning")
+        local _remaining    = BIND_TIMEOUT
+        BindBtn.Text        = "..." .. _remaining
+        BindBtn.TextColor3  = ThemeEngine.GetToken("Warning")
         TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
             Color = ThemeEngine.GetToken("Warning"),
         })
+
+        -- Countdown display: "...5" → "...4" → … → auto-cancel at 0.
+        countdownThread = task.spawn(function()
+            while isListening and _remaining > 0 do
+                task.wait(1)
+                _remaining -= 1
+                if isListening then
+                    BindBtn.Text = _remaining > 0 and ("..." .. _remaining) or "..."
+                end
+            end
+        end)
+        timeoutThread = task.delay(BIND_TIMEOUT, function()
+            if isListening then stopListening() end
+        end)
 
         globalConn = UserInputService.InputBegan:Connect(function(input, _gameProcessed)
             -- NOTE: gameProcessed guard intentionally omitted.
@@ -7508,6 +7543,7 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         _destroyed = true
         if globalConn then globalConn:Disconnect() end
         if timeoutThread then pcall(task.cancel, timeoutThread) end
+        if countdownThread then pcall(task.cancel, countdownThread) end
         _activateConn:Disconnect()
         hoverConn1:Disconnect()
         hoverConn2:Disconnect()
