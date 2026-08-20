@@ -6032,6 +6032,10 @@ function ColorPicker.New(parent: Instance, config: table, debugId: string?)
             alpha = math.clamp(newAlpha, 0, 1)
         end
         rebuildColor(true)
+        -- Preserve the exact Color3 the caller passed so Get() returns it bitwise-equal.
+        -- rebuildColor() sets currentColor = Color3.fromHSV(h,s,v) which loses precision
+        -- on non-primary colors due to HSV round-trip; lock it back to the source here.
+        currentColor = color
     end
 
     function api:Enable()
@@ -6876,8 +6880,10 @@ end
 -- ── Components.Keybind ────────────────────────────────────
 _Delirium_modules["Components.Keybind"] = function()
 -- Components/Keybind.lua
--- Mobile: tapping while listening cancels (no physical keyboard).
--- Auto-cancel after 6s on touch devices so the component never stays stuck.
+-- Desktop : bind via keyboard (existing behaviour).
+-- Mobile  : floating on-screen TouchButton that fires OnActivated on tap.
+--           BindBtn enters placement-drag mode so the user can reposition it.
+--           Position persisted per-keybind title via ConfigService.
 
 local UserInputService = game:GetService("UserInputService")
 -- local Root             = script.Parent.Parent
@@ -6887,6 +6893,32 @@ local ThemeEngine      = _Delirium_require("Core.ThemeEngine")
 local InputAdapter     = _Delirium_require("Core.InputAdapter")
 local Signal           = _Delirium_require("Utilities.Signal")
 local VariantEngine    = _Delirium_require("Core.VariantEngine")
+local ConfigService    = _Delirium_require("Services.ConfigService")
+
+-- ─── Module-level helpers ─────────────────────────────────────────────────────
+
+-- Walk up the instance tree to find the first ScreenGui ancestor.
+local function _findScreenGui(inst: Instance): ScreenGui?
+    local cur = inst.Parent
+    while cur do
+        if cur:IsA("ScreenGui") then return cur end
+        cur = cur.Parent
+    end
+    return nil
+end
+
+-- Clamp an offset Vector2 position so the button stays inside the viewport.
+local function _clampPosition(pos: Vector2, btnSize: Vector2): Vector2
+    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+        or Vector2.new(1920, 1080)
+    return Vector2.new(
+        math.clamp(pos.X, 0, vp.X - btnSize.X),
+        math.clamp(pos.Y, 0, vp.Y - btnSize.Y)
+    )
+end
+
+-- Touch button size (px). Touch-friendly 52×52 target.
+local TOUCH_BTN_SIZE = Vector2.new(52, 52)
 
 local Keybind = {}
 
@@ -6896,26 +6928,52 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     local title      = config.Title or config.Name or config.Text or "Keybind"
     local desc       = config.Description or ""
     local currentKey = config.Default     or Enum.KeyCode.E
-    local enabled    = true
+    local enabled      = true
     local _destroyed  = false
     local isListening = false
+    -- Set to true the moment a new key is recorded. Cleared after the current
+    -- InputBegan event cycle via task.defer. Guards _activateConn from firing
+    -- OnActivated on the same input that was just used to rebind the key,
+    -- which can happen when Roblox fires globalConn before _activateConn in
+    -- the same InputBegan dispatch (connection order is not guaranteed).
+    local _justRebound = false
 
     local OnChanged   = Signal.new()
-    local OnActivated = Signal.new()  -- fires when the bound key is pressed in-game
+    local OnActivated = Signal.new()
 
-    -- Persistent key-press listener: runs always (not just while listening).
-    -- Fires OnActivated + config.Callback whenever the currently bound key is pressed.
-    -- NOTE: gameProcessed guard omitted intentionally — see Keybind.lua comment on
-    -- listen-mode globalConn for the same reason (DisplayOrder=100 marks all inputs
-    -- as gameProcessed=true even when window is hidden).
+    -- ─── ConfigService — touch button position persistence ─────────────────
+    local _cfg     = ConfigService.GetProfile("Delirium_KeybindPositions")
+    local _cfgKeyX = "touchbtn_" .. title .. "_x"
+    local _cfgKeyY = "touchbtn_" .. title .. "_y"
+
+    local function _loadTouchPos(): Vector2
+        local x = _cfg:Get(_cfgKeyX, nil)
+        local y = _cfg:Get(_cfgKeyY, nil)
+        if x and y then
+            return _clampPosition(Vector2.new(x, y), TOUCH_BTN_SIZE)
+        end
+        -- Default: bottom-right quadrant.
+        local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+            or Vector2.new(800, 600)
+        return _clampPosition(Vector2.new(vp.X * 0.82, vp.Y * 0.88), TOUCH_BTN_SIZE)
+    end
+
+    local function _saveTouchPos(pos: Vector2)
+        _cfg:Set(_cfgKeyX, pos.X)
+        _cfg:Set(_cfgKeyY, pos.Y)
+        _cfg:Save()
+    end
+
+    -- ─── Persistent key-press listener (desktop only) ───────────────────────
+    -- NOTE: gameProcessed guard omitted intentionally — DisplayOrder=100 marks
+    -- all inputs as gameProcessed=true even when the window is hidden.
     local _activateConn = UserInputService.InputBegan:Connect(function(input, _)
-        if not enabled then return end
-        if isListening then return end  -- don't fire while assigning a new key
+        if not enabled    then return end
+        if isListening    then return end
+        if _justRebound   then return end   -- same InputBegan that just recorded a new key
+        if InputAdapter.IsTouch then return end          -- handled by TouchButton
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
         if input.KeyCode ~= currentKey then return end
-        -- config.Callback is auto-bound to OnActivated via ComponentHelper.BindCallback.
-        -- Firing OnActivated is sufficient — do NOT call config.Callback directly
-        -- here or the callback would fire twice on every key press.
         OnActivated:Fire(currentKey)
     end)
 
@@ -6982,21 +7040,18 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
     ComponentHelper.AddCorner(BindBtn, 6)
     local btnStroke = ComponentHelper.AddStroke(BindBtn, ThemeEngine.GetToken("Border"), 1)
 
-    -- ─── Listening logic ───────────────────────────────────────────────────
+    -- ─── Listening logic (desktop) ─────────────────────────────────────────
 
     local globalConn
     local timeoutThread
-    local MOBILE_LISTEN_TIMEOUT = 6  -- seconds before auto-cancel on touch
 
-    -- Truncate long key names for the narrow button on mobile.
     local function keyDisplayName(): string
         if InputAdapter.IsTouch then
-            return currentKey.Name:sub(1, 6)
+            return currentKey.Name:sub(1, 4)
         end
         return currentKey.Name
     end
 
-    -- Apply initial display text based on device.
     BindBtn.Text = keyDisplayName()
 
     local function stopListening()
@@ -7016,7 +7071,6 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         })
     end
 
-    -- Hover states on BindBtn — always re-read live token so theme switches apply
     local hoverConn1 = BindBtn.MouseEnter:Connect(function()
         if not enabled or isListening then return end
         TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
@@ -7030,9 +7084,169 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         }, "btn_hover")
     end)
 
+    -- ─── Touch button (mobile only) ────────────────────────────────────────
+
+    local TouchButton      = nil
+    local touchBtnStroke   = nil
+    local _isPlacementMode = false
+    local _touchConns      = {}
+
+    local function _clearTouchConns()
+        for _, c in ipairs(_touchConns) do c:Disconnect() end
+        table.clear(_touchConns)
+    end
+    local function _addTouchConn(conn)
+        table.insert(_touchConns, conn)
+    end
+
+    local function _enterPlacementMode()
+        _isPlacementMode   = true
+        BindBtn.Text       = "Lock"
+        BindBtn.TextColor3 = ThemeEngine.GetToken("Warning")
+        TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
+            Color = ThemeEngine.GetToken("Warning"),
+        })
+        if TouchButton and touchBtnStroke then
+            TweenHelper.Tween(touchBtnStroke, TweenHelper.FastInfo, {
+                Color = ThemeEngine.GetToken("Warning"),
+            })
+        end
+    end
+
+    local function _exitPlacementMode()
+        _isPlacementMode = false
+        if TouchButton then
+            local pos = Vector2.new(
+                TouchButton.Position.X.Offset,
+                TouchButton.Position.Y.Offset
+            )
+            _saveTouchPos(pos)
+            if touchBtnStroke then
+                TweenHelper.Tween(touchBtnStroke, TweenHelper.FastInfo, {
+                    Color = ThemeEngine.GetToken("Border"),
+                })
+            end
+        end
+        BindBtn.Text       = keyDisplayName()
+        BindBtn.TextColor3 = ThemeEngine.GetToken("Text")
+        TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
+            Color = ThemeEngine.GetToken("Border"),
+        })
+    end
+
+    local function _buildTouchButton()
+        -- Defer one frame so Row is fully in the hierarchy before we walk up.
+        task.defer(function()
+            if _destroyed then return end
+
+            local screenGui = _findScreenGui(Row)
+            if not screenGui then
+                warn("Keybind (" .. title .. "): ScreenGui ancestor not found — TouchButton skipped")
+                return
+            end
+
+            local initPos = _loadTouchPos()
+
+            TouchButton = ComponentHelper.Create("TextButton", {
+                Name             = "KeybindTouch_" .. title,
+                Position         = UDim2.fromOffset(initPos.X, initPos.Y),
+                Size             = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
+                BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
+                Text             = currentKey.Name:sub(1, 4),
+                TextColor3       = ThemeEngine.GetToken("Text"),
+                TextSize         = 13,
+                Font             = Enum.Font.GothamBold,
+                AutoButtonColor  = false,
+                ZIndex           = 20,
+                Visible          = Row.Visible,
+                Parent           = screenGui,
+            })
+            ComponentHelper.AddCorner(TouchButton, 10)
+            touchBtnStroke = ComponentHelper.AddStroke(
+                TouchButton, ThemeEngine.GetToken("Border"), 1.5
+            )
+
+            -- Press scale feedback.
+            local function _animPress()
+                TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                    Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X - 6, TOUCH_BTN_SIZE.Y - 6),
+                }, "touch_press")
+            end
+            local function _animRelease()
+                TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                    Size = UDim2.fromOffset(TOUCH_BTN_SIZE.X, TOUCH_BTN_SIZE.Y),
+                }, "touch_press")
+            end
+
+            -- Per-touch state.
+            local _dragStart   = nil
+            local _btnStartPos = nil
+            local _wasDragged  = false
+
+            _addTouchConn(TouchButton.InputBegan:Connect(function(input)
+                if input.UserInputType ~= Enum.UserInputType.Touch then return end
+                _dragStart   = InputAdapter.GetPointerPosition(input)
+                _btnStartPos = Vector2.new(
+                    TouchButton.Position.X.Offset,
+                    TouchButton.Position.Y.Offset
+                )
+                _wasDragged = false
+                if not _isPlacementMode then _animPress() end
+            end))
+
+            _addTouchConn(TouchButton.InputChanged:Connect(function(input)
+                if input.UserInputType ~= Enum.UserInputType.Touch then return end
+                if not _dragStart or not _btnStartPos then return end
+                local delta = InputAdapter.GetPointerPosition(input) - _dragStart
+                if delta.Magnitude > InputAdapter.DRAG_THRESHOLD_TOUCH then
+                    _wasDragged = true
+                end
+                -- Only reposition during placement mode.
+                if _isPlacementMode and _wasDragged then
+                    local newPos = _clampPosition(_btnStartPos + delta, TOUCH_BTN_SIZE)
+                    TouchButton.Position = UDim2.fromOffset(newPos.X, newPos.Y)
+                end
+            end))
+
+            _addTouchConn(TouchButton.InputEnded:Connect(function(input)
+                if input.UserInputType ~= Enum.UserInputType.Touch then return end
+                _animRelease()
+                if _isPlacementMode then
+                    -- Persist wherever the button landed (tap or drag).
+                    local pos = Vector2.new(
+                        TouchButton.Position.X.Offset,
+                        TouchButton.Position.Y.Offset
+                    )
+                    _saveTouchPos(pos)
+                else
+                    -- Normal mode: clean tap fires OnActivated.
+                    if not _wasDragged and enabled then
+                        OnActivated:Fire(currentKey)
+                    end
+                end
+                _dragStart   = nil
+                _btnStartPos = nil
+                _wasDragged  = false
+            end))
+        end)
+    end
+
+    -- ─── BindBtn click — unified handler ──────────────────────────────────
+
     BindBtn.MouseButton1Click:Connect(function()
         if not enabled then return end
-        -- Tapping while listening cancels on mobile (no Escape key available).
+
+        if InputAdapter.IsTouch then
+            -- Mobile: toggle placement mode instead of keyboard listen.
+            if _isPlacementMode then
+                _exitPlacementMode()
+            else
+                _enterPlacementMode()
+            end
+            return
+        end
+
+        -- Desktop: keyboard-listen mode.
         if isListening then
             stopListening()
             return
@@ -7045,56 +7259,64 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
             Color = ThemeEngine.GetToken("Warning"),
         })
 
-        -- Auto-cancel on touch after timeout — keyboard input will never arrive.
-        if InputAdapter.IsTouch then
-            timeoutThread = task.delay(MOBILE_LISTEN_TIMEOUT, function()
-                timeoutThread = nil
-                if isListening then stopListening() end
-            end)
-        end
-
         globalConn = UserInputService.InputBegan:Connect(function(input, _gameProcessed)
             -- NOTE: gameProcessed guard intentionally omitted.
-            -- With DisplayOrder=100, Roblox marks inputs as GUI-processed even
-            -- when window contents are hidden (ScreenGui still exists). Guarding
-            -- on gameProcessed would block keybind presses while window is hidden.
+            -- DisplayOrder=100 marks inputs as GUI-processed even when window is hidden.
             if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
             if input.KeyCode == Enum.KeyCode.Escape then
                 stopListening()
                 return
             end
             if input.KeyCode ~= Enum.KeyCode.Unknown then
+                -- Raise the guard BEFORE stopListening() resets isListening,
+                -- so _activateConn can't slip through on this same InputBegan.
+                _justRebound = true
                 currentKey = input.KeyCode
+                if TouchButton then
+                    TouchButton.Text = currentKey.Name:sub(1, 4)
+                end
                 OnChanged:Fire(currentKey)
                 stopListening()
+                -- Lower the guard after the current event cycle fully drains.
+                task.defer(function() _justRebound = false end)
             end
         end)
     end)
+
+    -- Build touch button on mobile.
+    if InputAdapter.IsTouch then
+        _buildTouchButton()
+    end
 
     -- ─── Theme updates ─────────────────────────────────────────────────────
 
     local themeDisconnect = ThemeEngine.OnThemeChanged(function(tokens)
         -- Direct property sets (no tween) so hidden-tab components always
         -- hold the correct color when their PageCanvas becomes Visible again.
-        Row.BackgroundColor3   = tokens.Surface
-        rowStroke.Color        = tokens.Border
-        titleLabel.TextColor3  = tokens.Text
+        Row.BackgroundColor3     = tokens.Surface
+        rowStroke.Color          = tokens.Border
+        titleLabel.TextColor3    = tokens.Text
         BindBtn.BackgroundColor3 = tokens.SurfaceActive
-        if not isListening then
+        if not isListening and not _isPlacementMode then
             BindBtn.TextColor3 = tokens.Text
             btnStroke.Color    = tokens.Border
         end
         if descLabel then
             descLabel.TextColor3 = tokens.SubText
         end
+        if TouchButton and touchBtnStroke then
+            TouchButton.BackgroundColor3 = tokens.SurfaceActive
+            TouchButton.TextColor3       = tokens.Text
+            if not _isPlacementMode then
+                touchBtnStroke.Color = tokens.Border
+            end
+        end
     end)
 
     -- ─── Public API ────────────────────────────────────────────────────────
 
     local api = setmetatable({}, {
-        __tostring = function(self)
-            return self:GetDisplay()
-        end
+        __tostring = function(self) return self:GetDisplay() end,
     })
 
     function api:Get(): Enum.KeyCode
@@ -7107,8 +7329,12 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
 
     function api:Set(key: Enum.KeyCode)
         if isListening then stopListening() end
-        currentKey = key
+        if _isPlacementMode then _exitPlacementMode() end
+        currentKey   = key
         BindBtn.Text = keyDisplayName()
+        if TouchButton then
+            TouchButton.Text = key.Name:sub(1, 4)
+        end
         OnChanged:Fire(currentKey)
     end
 
@@ -7117,7 +7343,6 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
             TextColor3 = ThemeEngine.GetToken("Text"),
         })
-        -- Restore BindBtn to normal visual state
         TweenHelper.Tween(BindBtn, TweenHelper.FastInfo, {
             BackgroundColor3 = ThemeEngine.GetToken("SurfaceActive"),
             TextColor3       = ThemeEngine.GetToken("Text"),
@@ -7125,20 +7350,42 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         TweenHelper.Tween(btnStroke, TweenHelper.FastInfo, {
             Color = ThemeEngine.GetToken("Border"),
         })
+        if TouchButton then
+            TouchButton.Active = true
+            TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                BackgroundTransparency = 0,
+            })
+        end
     end
 
     function api:Disable()
         enabled = false
         if isListening then stopListening() end
+        if _isPlacementMode then _exitPlacementMode() end
         TweenHelper.Tween(titleLabel, TweenHelper.FastInfo, {
             TextColor3 = ThemeEngine.GetToken("DisabledText"),
         })
+        if TouchButton then
+            TouchButton.Active = false
+            TweenHelper.Tween(TouchButton, TweenHelper.FastInfo, {
+                BackgroundTransparency = 0.5,
+            })
+        end
     end
 
-    function api:SetTitle(t: string) titleLabel.Text = t end
+    function api:SetTitle(t: string)
+        titleLabel.Text = t
+    end
 
-    function api:Show()  Row.Visible = true  end
-    function api:Hide()  Row.Visible = false end
+    function api:Show()
+        Row.Visible = true
+        if TouchButton then TouchButton.Visible = true end
+    end
+
+    function api:Hide()
+        Row.Visible = false
+        if TouchButton then TouchButton.Visible = false end
+    end
 
     function api:Destroy()
         if _destroyed then return end
@@ -7149,6 +7396,11 @@ function Keybind.New(parent: Instance, config: table, debugId: string?)
         hoverConn1:Disconnect()
         hoverConn2:Disconnect()
         themeDisconnect()
+        _clearTouchConns()
+        if TouchButton then
+            TouchButton:Destroy()
+            TouchButton = nil
+        end
         OnChanged:Destroy()
         OnActivated:Destroy()
         Row:Destroy()
@@ -7443,6 +7695,10 @@ function Paragraph.New(parent: Instance, config: table)
         end
     end
 
+    -- Maid must be declared here, before the GiveTask calls below that use it.
+    local maid       = Maid.new()
+    local _destroyed = false
+
     -- Re-measure when frame width settles (resolves 1-scale children after parent layout).
     maid:GiveTask(frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(_measureBody))
 
@@ -7469,8 +7725,6 @@ function Paragraph.New(parent: Instance, config: table)
 
     -- ─── Public API ──────────────────────────────────────────────────────────
 
-    local _destroyed = false
-    local maid       = Maid.new()
     local api = {}
 
     function api:SetTitle(text: string)
