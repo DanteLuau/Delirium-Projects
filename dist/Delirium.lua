@@ -6183,6 +6183,7 @@ function Divider.New(parent: Instance, config: table)
 
     local rightLine
     local textLabel
+    local maid = Maid.new()
 
     if hasLabel then
         -- Right line
@@ -6255,7 +6256,6 @@ function Divider.New(parent: Instance, config: table)
     -- ─── Public API ──────────────────────────────────────────────────────────
 
     local _destroyed = false
-    local maid       = Maid.new()
     local api = {}
 
     function api:SetLabel(text: string)
